@@ -40,7 +40,7 @@ def send(text: str):
             timeout=15
         )
         if r.status_code == 200:
-            log.info("✅ Сообщение отправлено")
+            log.info("Сообщение отправлено")
         else:
             log.error(f"Telegram ошибка: {r.text}")
     except Exception as e:
@@ -617,37 +617,36 @@ def build_report(df15m, df1h, df4h, df1d, fund, oi, oi_hist, ls, taker, ob):
     oie = "🟢" if oi_hist["trend"] == "RISING" else ("🔴" if oi_hist["trend"] == "FALLING" else "⚪")
 
     lines = [
-        f"<b>{'━'*30}</b>",
-        f"<b>{SYMBOL} {price:.2f} $</b>",
-        f"<b>{'━'*30}</b>",
+        f"{'━'*30}",
+        f"{SYMBOL} {price:.2f} $",
+        f"{'━'*30}",
         "",
-        f"<b>📊 РЫНОК</b>",
+        "РЫНОК",
         f"{fe} Фандинг: {fund['rate']:.5f} ({fund['trend']})",
         f"{lse} Лонг/Шорт: {ls['long_pct']:.1f}% / {ls['short_pct']:.1f}%",
         f"{te} Taker ratio: {taker:.2f}",
         f"{obe} Стакан: {'+' if ob > 0 else ''}{ob:.1f}%",
         f"{oie} OI тренд: {oi_hist['trend']} ({oi_hist['current']:,.0f})",
-        f"{bias_e.get(bias, '⚪')} 4h/1d тренд: <b>{bias}</b> ({bias_str}%)",
+        f"{bias_e.get(bias, '⚪')} 4h/1d тренд: {bias} ({bias_str}%)",
     ]
 
     if sup or res:
-        lines += ["", "<b>📐 УРОВНИ (1h)</b>"]
+        lines += ["", "УРОВНИ (1h)"]
         if res:
-            lines.append("🔴 Сопр: " + " · ".join(f"{x:.2f}" for x in res))
+            lines.append("Сопр: " + " · ".join(f"{x:.2f}" for x in res))
         if sup:
-            lines.append("🟢 Подд: " + " · ".join(f"{x:.2f}" for x in sup))
+            lines.append("Подд: " + " · ".join(f"{x:.2f}" for x in sup))
 
     all_bull = pb1h + pb15
     all_bear = ps1h + ps15
     if all_bull or all_bear:
-        lines.append("")
-        lines.append("<b>🕯️ ПАТТЕРНЫ</b>")
+        lines += ["", "ПАТТЕРНЫ"]
         if all_bull:
             lines.append("🟢 " + " ".join(all_bull))
         if all_bear:
             lines.append("🔴 " + " ".join(all_bear))
 
-    lines += ["", "<b>🎯 СИГНАЛЫ</b>", ""]
+    lines += ["", "СИГНАЛЫ", ""]
 
     combos = [
         (df15m, "15m", "SCALP"),
@@ -663,22 +662,22 @@ def build_report(df15m, df1h, df4h, df1d, fund, oi, oi_hist, ls, taker, ob):
             ls_n = res_s.get("ls", 0)
             ss_n = res_s.get("ss", 0)
             if ls_n == -1:
-                lines.append(f"🟡 [{tf} {style}] Флэт — нет входа")
+                lines.append(f"[{tf} {style}] Флэт — нет входа")
             else:
-                lines.append(f"🟡 [{tf} {style}] ЖДИ L:{ls_n} S:{ss_n}")
+                lines.append(f"[{tf} {style}] ЖДИ L:{ls_n} S:{ss_n}")
         else:
             any_signal = True
             e = "🟢" if res_s["direction"] == "LONG" else "🔴"
             lines.append(
-                f"{e} <b>[{tf} · {style} · {res_s['direction']}]</b> {res_s['score']} очков\n"
-                f"   Вход: <b>{res_s['entry']:.2f}</b>\n"
+                f"{e} [{tf} · {style} · {res_s['direction']}] {res_s['score']} очков\n"
+                f"   Вход: {res_s['entry']:.2f}\n"
                 f"   Стоп: {res_s['stop']:.2f} | ТП1: {res_s['tp1']:.2f} ТП2: {res_s['tp2']:.2f}\n"
                 f"   R/R: {res_s['rr']:.1f} | Stoch: {res_s['stoch']:.0f} MACD: {'↑' if res_s['macd_hist'] > 0 else '↓'}\n"
-                f"   <i>{' · '.join(res_s['reasons'][:6])}</i>"
+                f"   Причины: {' · '.join(res_s['reasons'][:6])}"
             )
 
     if not any_signal:
-        lines.append("🟡 Чётких сигналов нет — жди подтверждения")
+        lines.append("Чётких сигналов нет — жди подтверждения")
 
     lines.append(f"\n{datetime.utcnow().strftime('%d.%m.%Y %H:%M')} UTC")
     return "\n".join(lines)
@@ -687,7 +686,7 @@ def build_report(df15m, df1h, df4h, df1d, fund, oi, oi_hist, ls, taker, ob):
 # ОСНОВНОЙ ЦИКЛ
 # ══════════════════════════════════════════════
 def run_scan():
-    log.info("🔄 Запуск сканирования...")
+    log.info("Запуск сканирования...")
     try:
         df15m = get_klines("15m", 300)
         df1h = get_klines("1h", 300)
@@ -704,22 +703,22 @@ def run_scan():
         ob = get_orderbook()
         report = build_report(df15m, df1h, df4h, df1d, fund, oi, oi_hist, ls, taker, ob)
         send(report)
-        log.info("✅ Скан завершён")
+        log.info("Скан завершён")
     except Exception as e:
         log.error(f"Ошибка скана: {e}")
-        send(f"❌ Ошибка скана: {e}")
+        send(f"Ошибка скана: {e}")
 
 def bot_loop():
-    log.info(f"🤖 Бот запущен | {SYMBOL} | интервал {SCAN_INTERVAL // 60} мин")
+    log.info(f"Бот запущен | {SYMBOL} | интервал {SCAN_INTERVAL // 60} мин")
     send(
-        f"✅ <b>ETH Signal Bot запущен</b>\n"
+        f"ETH Signal Bot запущен\n"
         f"Символ: {SYMBOL}\n"
         f"Интервал: каждые {SCAN_INTERVAL // 60} мин\n"
         f"{datetime.utcnow().strftime('%d.%m.%Y %H:%M')} UTC"
     )
     while True:
         run_scan()
-        log.info(f"⏳ Следующий скан через {SCAN_INTERVAL // 60} мин")
+        log.info(f"Следующий скан через {SCAN_INTERVAL // 60} мин")
         time.sleep(SCAN_INTERVAL)
 
 # ══════════════════════════════════════════════
