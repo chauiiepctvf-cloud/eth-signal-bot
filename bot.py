@@ -154,7 +154,6 @@ def get_orderbook():
 # ИНДИКАТОРЫ
 # ══════════════════════════════════════════════
 def calc(df: pd.DataFrame) -> pd.DataFrame:
-    # Скользящие средние
     df["EMA9"] = df["close"].ewm(span=9, adjust=False).mean()
     df["EMA21"] = df["close"].ewm(span=21, adjust=False).mean()
     df["EMA50"] = df["close"].ewm(span=50, adjust=False).mean()
@@ -162,23 +161,19 @@ def calc(df: pd.DataFrame) -> pd.DataFrame:
     df["MA50"] = df["close"].rolling(50).mean()
     df["MA200"] = df["close"].rolling(200).mean()
 
-    # RSI Wilder
     d = df["close"].diff()
     gain = d.clip(lower=0).ewm(com=13, adjust=False).mean()
     loss = (-d.clip(upper=0)).ewm(com=13, adjust=False).mean()
     df["RSI"] = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
 
-    # RSI сглаженный (сигнальная линия RSI)
     df["RSI_sig"] = df["RSI"].ewm(span=9, adjust=False).mean()
 
-    # Stochastic RSI
     rsi_min = df["RSI"].rolling(14).min()
     rsi_max = df["RSI"].rolling(14).max()
     stoch_k = (df["RSI"] - rsi_min) / (rsi_max - rsi_min + 1e-10) * 100
     df["STOCH_K"] = stoch_k.rolling(3).mean()
     df["STOCH_D"] = df["STOCH_K"].rolling(3).mean()
 
-    # MACD
     ema12 = df["close"].ewm(span=12, adjust=False).mean()
     ema26 = df["close"].ewm(span=26, adjust=False).mean()
     df["MACD"] = ema12 - ema26
@@ -187,13 +182,11 @@ def calc(df: pd.DataFrame) -> pd.DataFrame:
     df["MACD_cross_bull"] = (df["MACD"] > df["MACD_sig"]) & (df["MACD"].shift(1) <= df["MACD_sig"].shift(1))
     df["MACD_cross_bear"] = (df["MACD"] < df["MACD_sig"]) & (df["MACD"].shift(1) >= df["MACD_sig"].shift(1))
 
-    # ATR Wilder
     hl = df["high"] - df["low"]
     hpc = (df["high"] - df["close"].shift()).abs()
     lpc = (df["low"] - df["close"].shift()).abs()
     df["ATR"] = pd.concat([hl, hpc, lpc], axis=1).max(axis=1).ewm(com=13, adjust=False).mean()
 
-    # Bollinger Bands
     df["BB_mid"] = df["close"].rolling(20).mean()
     bb_std = df["close"].rolling(20).std()
     df["BB_upper"] = df["BB_mid"] + 2 * bb_std
@@ -201,36 +194,22 @@ def calc(df: pd.DataFrame) -> pd.DataFrame:
     df["BB_width"] = (df["BB_upper"] - df["BB_lower"]) / df["BB_mid"]
     df["BB_pct"] = (df["close"] - df["BB_lower"]) / (df["BB_upper"] - df["BB_lower"] + 1e-10)
 
-    # VWAP скользящий
     df["VWAP"] = (df["close"] * df["volume"]).rolling(20).sum() / df["volume"].rolling(20).sum()
 
-    # CVD — кумулятивная дельта объёма
     df["delta"] = df["taker_buy_base"] - (df["volume"] - df["taker_buy_base"])
     df["CVD"] = df["delta"].rolling(20).sum()
     df["CVD_up"] = df["CVD"] > df["CVD"].shift(3)
 
-    # Объём
     df["vol_ma"] = df["volume"].rolling(20).mean()
     df["vol_spike"] = df["volume"] > df["vol_ma"] * 1.5
 
-    # RSI дивергенция (улучшенная — ищем за 10 свечей)
-    df["div_bull"] = (
-        (df["close"] < df["close"].shift(10)) &
-        (df["RSI"] > df["RSI"].shift(10)) &
-        (df["RSI"] < 50)
-    )
-    df["div_bear"] = (
-        (df["close"] > df["close"].shift(10)) &
-        (df["RSI"] < df["RSI"].shift(10)) &
-        (df["RSI"] > 50)
-    )
+    df["div_bull"] = (df["close"] < df["close"].shift(10)) & (df["RSI"] > df["RSI"].shift(10)) & (df["RSI"] < 50)
+    df["div_bear"] = (df["close"] > df["close"].shift(10)) & (df["RSI"] < df["RSI"].shift(10)) & (df["RSI"] > 50)
 
-    # Уровни поддержки/сопротивления
     w = 8
     df["is_high"] = df["high"].rolling(w * 2 + 1, center=True).max() == df["high"]
     df["is_low"] = df["low"].rolling(w * 2 + 1, center=True).min() == df["low"]
 
-    # Волатильность (ATR / цена) — для фильтрации флэта
     df["vol_pct"] = df["ATR"] / df["close"] * 100
     return df
 
@@ -366,7 +345,6 @@ def score_signal(df, fund, oi_hist, style, bias, ls, taker, ob):
         S += 1
         R_S.append(f"RSI {rsi:.0f}↑")
 
-    # RSI пересек сигнальную линию
     if r["RSI"] > r["RSI_sig"] and df["RSI"].iloc[-2] <= df["RSI_sig"].iloc[-2]:
         L += 1
         R_L.append("RSI↗сигнал")
@@ -374,7 +352,6 @@ def score_signal(df, fund, oi_hist, style, bias, ls, taker, ob):
         S += 1
         R_S.append("RSI↘сигнал")
 
-    # Stochastic RSI
     sk = r["STOCH_K"]
     sd = r["STOCH_D"]
     if sk < 20 and sd < 20:
@@ -390,7 +367,6 @@ def score_signal(df, fund, oi_hist, style, bias, ls, taker, ob):
         S += 1
         R_S.append("StochRSI↓")
 
-    # MACD
     if r["MACD_cross_bull"]:
         L += 2
         R_L.append("MACD крест↑")
@@ -404,7 +380,6 @@ def score_signal(df, fund, oi_hist, style, bias, ls, taker, ob):
         S += 1
         R_S.append("MACD↓")
 
-    # VWAP
     vwap_diff = (price - r["VWAP"]) / r["VWAP"] * 100
     if price < r["VWAP"]:
         L += 1
@@ -413,7 +388,6 @@ def score_signal(df, fund, oi_hist, style, bias, ls, taker, ob):
         S += 1
         R_S.append(f"Цена>VWAP(+{vwap_diff:.1f}%)")
 
-    # Bollinger
     bp = r["BB_pct"]
     if bp < 0.05:
         L += 3
@@ -428,7 +402,6 @@ def score_signal(df, fund, oi_hist, style, bias, ls, taker, ob):
         S += 1
         R_S.append(f"BB верх")
 
-    # EMA
     if r["EMA9"] > r["EMA21"]:
         L += 1
         R_L.append("EMA9>21")
@@ -442,7 +415,6 @@ def score_signal(df, fund, oi_hist, style, bias, ls, taker, ob):
         S += 1
         R_S.append("EMA50<200")
 
-    # CVD
     if r["CVD_up"]:
         L += 2
         R_L.append("CVD↑покупки")
@@ -450,7 +422,6 @@ def score_signal(df, fund, oi_hist, style, bias, ls, taker, ob):
         S += 2
         R_S.append("CVD↓продажи")
 
-    # RSI дивергенция
     if r["div_bull"]:
         L += 3
         R_L.append("Div RSI")
@@ -458,7 +429,6 @@ def score_signal(df, fund, oi_hist, style, bias, ls, taker, ob):
         S += 3
         R_S.append("Div RSI")
 
-    # Фандинг
     if fund_r < -0.001:
         L += 3
         R_L.append(f"Fund{fund_r:.5f}↓")
@@ -484,7 +454,6 @@ def score_signal(df, fund, oi_hist, style, bias, ls, taker, ob):
         S += 1
         R_S.append("Fund↑тренд")
 
-    # Long/Short Ratio
     if lp < 40:
         L += 3
         R_L.append(f"L/S {lp:.0f}%")
@@ -502,7 +471,6 @@ def score_signal(df, fund, oi_hist, style, bias, ls, taker, ob):
     elif lp > 55:
         S += 1
 
-    # Taker Ratio
     if taker > 1.2:
         L += 2
         R_L.append(f"Taker {taker:.2f}покуп")
@@ -514,7 +482,6 @@ def score_signal(df, fund, oi_hist, style, bias, ls, taker, ob):
     elif taker < 1.0:
         S += 1
 
-    # Стакан
     if ob > 20:
         L += 3
         R_L.append(f"Стакан+{ob:.0f}%")
@@ -532,7 +499,6 @@ def score_signal(df, fund, oi_hist, style, bias, ls, taker, ob):
     elif ob < -5:
         S += 1
 
-    # OI тренд
     if oi_tr == "RISING":
         L += 1
         R_L.append("OI↑")
@@ -540,14 +506,12 @@ def score_signal(df, fund, oi_hist, style, bias, ls, taker, ob):
         S += 1
         R_S.append("OI↓")
 
-    # Объём
     if r["vol_spike"]:
         L += 1
         R_L.append("Vol↑")
         S += 1
         R_S.append("Vol↑")
 
-    # HTF Bias
     if bias == "LONG":
         L += 3
         R_L.append("4h бычий")
@@ -557,7 +521,6 @@ def score_signal(df, fund, oi_hist, style, bias, ls, taker, ob):
         R_S.append("4h медвежий")
         L -= 5
 
-    # Порог
     thr = {"SCALP": 8, "MID": 10, "SWING": 12}.get(style, 10)
     if L >= thr and L > S:
         direction, sc, reasons = "LONG", L, R_L
@@ -566,7 +529,6 @@ def score_signal(df, fund, oi_hist, style, bias, ls, taker, ob):
     else:
         return {**empty, "ls": L, "ss": S}
 
-    # Уровни входа
     m = {"SCALP": (0.6, 0.8, 1.4), "MID": (1.2, 1.5, 2.5), "SWING": (2.0, 2.5, 4.0)}
     sm, t1m, t2m = m.get(style, m["MID"])
     if direction == "LONG":
