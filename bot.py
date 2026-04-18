@@ -13,7 +13,7 @@ from flask import Flask
 # ══════════════════════════════════════════════
 # НАСТРОЙКИ
 # ══════════════════════════════════════════════
-TELEGRAM_TOKEN = os.environ.get("8710461065:AAEtou4YT-j283WLBX2AsouBEX9mQDXsGicх")
+TELEGRAM_TOKEN = os.environ.get("8227282003:AAGlF5GMA5DoovMbxOY4UfIXbpmy96-ITp8")
 CHAT_ID = os.environ.get("CHAT_ID")
 SYMBOL = "ETHUSDT"
 SCAN_INTERVAL = 30 * 60  # 30 минут
