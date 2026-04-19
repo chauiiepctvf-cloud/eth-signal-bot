@@ -1,4 +1,3 @@
-
 import os
 import time
 import logging
@@ -29,8 +28,7 @@ QTY              = 0.01
 MIN_SCORE        = 7
 MAX_SCORE        = 13
 
-# ⚠️ ДЛЯ ТЕСТА BYBIT — ПРИНУДИТЕЛЬНЫЙ СИГНАЛ (force_test = True)
-FORCE_TEST       = True   # ← После проверки смени на False
+FORCE_TEST       = True   # принудительный сигнал
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -41,9 +39,6 @@ app = Flask(__name__)
 def home():
     return f"Scalp Bot | {datetime.utcnow().strftime('%d.%m.%Y %H:%M')} UTC"
 
-# ══════════════════════════════════════════════
-# TELEGRAM
-# ══════════════════════════════════════════════
 def send_telegram(text):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         log.error("TELEGRAM_TOKEN или CHAT_ID не заданы")
@@ -62,7 +57,7 @@ def send_telegram(text):
         log.error(f"Telegram: {e}")
 
 # ══════════════════════════════════════════════
-# BYBIT V5 API — ПРАВИЛЬНАЯ ПОДПИСЬ
+# BYBIT V5 API
 # ══════════════════════════════════════════════
 RECV_WINDOW = "5000"
 
@@ -121,9 +116,6 @@ def bybit_get(endpoint: str, params: dict = None) -> dict:
         log.error(f"Bybit GET {endpoint}: {e}")
         return {}
 
-# ══════════════════════════════════════════════
-# BYBIT — ТОРГОВЫЕ ФУНКЦИИ
-# ══════════════════════════════════════════════
 def set_leverage(leverage: int = LEVERAGE) -> bool:
     body = {
         "category": "linear",
@@ -174,7 +166,11 @@ def get_balance() -> float:
         pass
     return 0.0
 
-def open_position(side: str, qty: float, stop_loss: float, take_profit: float) -> dict:
+# ══════════════════════════════════════════════
+# УПРОЩЁННАЯ ФУНКЦИЯ ОТПРАВКИ ОРДЕРА (БЕЗ TP/SL)
+# ══════════════════════════════════════════════
+def open_simple_order(side: str, qty: float) -> dict:
+    """Открывает простой рыночный ордер без стоп-лосса и тейк-профита"""
     set_leverage()
     switch_to_one_way_mode()
     body = {
@@ -185,10 +181,6 @@ def open_position(side: str, qty: float, stop_loss: float, take_profit: float) -
         "qty": str(qty),
         "timeInForce": "IOC",
         "positionIdx": 0,
-        "stopLoss": f"{stop_loss:.8f}".rstrip("0").rstrip("."),
-        "takeProfit": f"{take_profit:.8f}".rstrip("0").rstrip("."),
-        "slTriggerBy": "MarkPrice",
-        "tpTriggerBy": "MarkPrice",
     }
     r = bybit_post("/v5/order/create", body)
     return r
@@ -229,10 +221,7 @@ def get_orderbook_imbalance() -> float:
     except:
         return 0.0
 
-# ══════════════════════════════════════════════
-# ИНДИКАТОРЫ
-# ══════════════════════════════════════════════
-def calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
+def calc_indicators(df):
     df["EMA9"] = df["close"].ewm(span=9, adjust=False).mean()
     df["EMA21"] = df["close"].ewm(span=21, adjust=False).mean()
     df["EMA50"] = df["close"].ewm(span=50, adjust=False).mean()
@@ -263,9 +252,6 @@ def calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-# ══════════════════════════════════════════════
-# СИСТЕМА БАЛЛОВ
-# ══════════════════════════════════════════════
 def get_scalp_signal(df, funding, ob, force_test=False):
     row = df.iloc[-1]
     prev = df.iloc[-2]
@@ -345,9 +331,6 @@ def get_scalp_signal(df, funding, ob, force_test=False):
               f"ATR {atr:.2f}")
     return direction, entry, stop, tp, score, reason
 
-# ══════════════════════════════════════════════
-# ШКАЛА БАЛЛОВ
-# ══════════════════════════════════════════════
 def score_bar(score, max_score=MAX_SCORE) -> str:
     pct = score / max_score
     filled = round(pct * 10)
@@ -355,9 +338,6 @@ def score_bar(score, max_score=MAX_SCORE) -> str:
     emoji = "🟢" if pct >= 0.8 else ("🟡" if pct >= 0.6 else "🔴")
     return f"{emoji} [{bar}] {score}/{max_score}"
 
-# ══════════════════════════════════════════════
-# ГЛАВНЫЙ ЦИКЛ
-# ══════════════════════════════════════════════
 last_trade_time = 0
 COOLDOWN = 15 * 60
 
@@ -411,7 +391,8 @@ def run_scan():
         msg_lines.append(f"⚠️ BYBIT_API_KEY не задан — ордер не отправлен")
     else:
         bybit_side = "Buy" if direction == "LONG" else "Sell"
-        result = open_position(bybit_side, QTY, stop, tp)
+        # Отправляем простой ордер без стоп-лосса и тейк-профита
+        result = open_simple_order(bybit_side, QTY)
         code = result.get("retCode", -1)
 
         if code == 0:
@@ -421,7 +402,6 @@ def run_scan():
                 f"✅ <b>ИСПОЛНЕНО НА BYBIT</b>",
                 f"   OrderID: {order_id}",
                 f"   Кол-во: {QTY} ETH",
-                f"   Стоп: {stop} | Тейк: {tp}",
             ]
             log.info(f"✅ Ордер открыт: {direction} {QTY} ETH | ID: {order_id}")
         else:
@@ -463,4 +443,3 @@ if __name__ == "__main__":
     t.start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
