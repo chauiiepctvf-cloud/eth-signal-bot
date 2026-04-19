@@ -135,40 +135,10 @@ def okx_get_positions() -> list:
     r = okx_get("/api/v5/account/positions", {"instId": SYMBOL})
     return [p for p in r.get("data", []) if float(p.get("pos", 0)) != 0]
 
-def okx_place_order(direction: str, entry: float, sl: float, tp: float) -> dict:
-    """Открывает ордер с TP/SL через attachAlgoOrds (новый формат OKX)"""
-    okx_set_leverage()
+def okx_place_order_simple(direction: str, qty: int) -> dict:
+    """Открывает простой рыночный ордер без TP/SL"""
     side = "buy" if direction == "LONG" else "sell"
     pos_side = "long" if direction == "LONG" else "short"
-    contract_size = 0.01
-    qty = max(1, round(ORDER_USDT * LEVERAGE / entry / contract_size))
-    
-    # Основной ордер
-    order_body = {
-        "instId": SYMBOL,
-        "tdMode": "cross",
-        "side": side,
-        "posSide": pos_side,
-        "ordType": "market",
-        "sz": str(qty),
-    }
-    
-    # TP/SL через attachAlgoOrds
-    attach_algo = [
-        {
-            "attachAlgoClOrdId": f"tp_{int(time.time())}",
-            "tpTriggerPx": str(round(tp, 2)),
-            "tpOrdPx": "-1",
-            "tpTriggerPxType": "last",
-        },
-        {
-            "attachAlgoClOrdId": f"sl_{int(time.time())}",
-            "slTriggerPx": str(round(sl, 2)),
-            "slOrdPx": "-1",
-            "slTriggerPxType": "last",
-        }
-    ]
-    
     body = {
         "instId": SYMBOL,
         "tdMode": "cross",
@@ -176,19 +146,60 @@ def okx_place_order(direction: str, entry: float, sl: float, tp: float) -> dict:
         "posSide": pos_side,
         "ordType": "market",
         "sz": str(qty),
-        "attachAlgoOrds": attach_algo,
     }
-    
     r = okx_post("/api/v5/trade/order", body)
     code = r.get("code", "-1")
     if code == "0":
         order_id = r["data"][0].get("ordId", "—")
-        log.info(f"✅ Ордер открыт: {direction} {qty} контр. | ID: {order_id}")
         return {"ok": True, "orderId": order_id, "qty": qty}
     else:
         msg = r.get("msg", "") or (r.get("data", [{}])[0].get("sMsg", ""))
-        log.error(f"❌ Ордер ошибка {code}: {msg}")
         return {"ok": False, "code": code, "msg": msg}
+
+def okx_set_tp_sl(order_id: str, direction: str, sl: float, tp: float) -> dict:
+    """Устанавливает TP/SL для существующей позиции"""
+    pos_side = "long" if direction == "LONG" else "short"
+    body = {
+        "instId": SYMBOL,
+        "posSide": pos_side,
+        "tpTriggerPx": str(round(tp, 2)),
+        "tpOrdPx": "-1",
+        "slTriggerPx": str(round(sl, 2)),
+        "slOrdPx": "-1",
+        "tpTriggerPxType": "last",
+        "slTriggerPxType": "last",
+    }
+    r = okx_post("/api/v5/trade/order-algo", body)
+    code = r.get("code", "-1")
+    if code == "0":
+        log.info(f"✅ TP/SL установлены: SL={sl}, TP={tp}")
+        return {"ok": True}
+    else:
+        msg = r.get("msg", "")
+        log.error(f"❌ TP/SL ошибка {code}: {msg}")
+        return {"ok": False, "code": code, "msg": msg}
+
+def okx_place_order(direction: str, entry: float, sl: float, tp: float) -> dict:
+    """Открывает ордер и затем устанавливает TP/SL"""
+    okx_set_leverage()
+    contract_size = 0.01
+    qty = max(1, round(ORDER_USDT * LEVERAGE / entry / contract_size))
+    
+    # Сначала открываем позицию
+    result = okx_place_order_simple(direction, qty)
+    if not result["ok"]:
+        return result
+    
+    # Затем устанавливаем TP/SL
+    time.sleep(0.5)  # небольшая задержка
+    tp_sl_result = okx_set_tp_sl(result["orderId"], direction, sl, tp)
+    
+    return {
+        "ok": result["ok"],
+        "orderId": result["orderId"],
+        "qty": qty,
+        "tp_sl_ok": tp_sl_result["ok"],
+    }
 
 # ══════════════════════════════════════════════
 # РЫНОЧНЫЕ ДАННЫЕ
@@ -440,6 +451,10 @@ def run_scan(force_test=False):
                 f"📦 Контрактов: {result['qty']}",
                 f"🆔 OrderID: {result['orderId']}",
             ]
+            if result.get("tp_sl_ok"):
+                msg.append(f"✅ TP/SL установлены")
+            else:
+                msg.append(f"⚠️ TP/SL не установлены")
         else:
             msg += [
                 f"❌ Ошибка OKX (код {result['code']}):",
