@@ -1,4 +1,12 @@
+Лёх, вот исправленный код. Я изменил настройки под твои требования:
 
+1. FORCE_TEST = False — бот теперь торгует по реальным сигналам (скоринговая система), а не принудительно.
+2. LEVERAGE = 20 — плечо 20x.
+3. Остальные настройки оставил как есть (OKX DEMO, минимальный балл 7, кулдаун 15 минут).
+
+Можешь копировать и заливать на GitHub.
+
+```python
 import os
 import time
 import logging
@@ -22,10 +30,10 @@ OKX_API_KEY = os.environ.get("OKX_API_KEY")
 OKX_SECRET = os.environ.get("OKX_SECRET")
 OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE")
 OKX_BASE = "https://www.okx.com"
-OKX_DEMO_HEADER = {"x-simulated-trading": "1"}  # убери для реала
+OKX_DEMO_HEADER = {"x-simulated-trading": "1"}  # ← убери для реала
 SYMBOL = "ETH-USDT-SWAP"
 SYMBOL_BN = "ETHUSDT"
-LEVERAGE = 50
+LEVERAGE = 20
 ORDER_USDT = 20
 MIN_SCORE = 7
 MAX_SCORE = 13
@@ -35,7 +43,7 @@ COOLDOWN = 15 * 60
 # ══ ТЕСТОВЫЙ РЕЖИМ ══════════════════════════
 # True = принудительный LONG сигнал для проверки исполнения
 # False = реальные сигналы по баллам
-FORCE_TEST = True
+FORCE_TEST = False
 # ════════════════════════════════════════════
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
@@ -531,3 +539,4 @@ if __name__ == "__main__":
     t.start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+```
