@@ -16,7 +16,7 @@ from flask import Flask
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 SYMBOL = "ETHUSDT"
-SCAN_INTERVAL = 5 * 60
+SCAN_INTERVAL = 5 * 60                     # 5 минут для скальпинга
 
 BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY")
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET")
@@ -33,6 +33,9 @@ app = Flask(__name__)
 def home():
     return f"Scalp Bot works | {datetime.now().strftime('%d.%m.%Y %H:%M')} UTC"
 
+# ══════════════════════════════════════════════
+# TELEGRAM
+# ══════════════════════════════════════════════
 def send_telegram(text):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         log.error("TELEGRAM_TOKEN or CHAT_ID not set!")
@@ -47,6 +50,9 @@ def send_telegram(text):
     except Exception as e:
         log.error(f"Telegram error: {e}")
 
+# ══════════════════════════════════════════════
+# BYBIT API (ИСПРАВЛЕННЫЕ ФУНКЦИИ)
+# ══════════════════════════════════════════════
 def bybit_request(endpoint, params=None):
     if not BYBIT_API_KEY or not BYBIT_API_SECRET:
         return None
@@ -66,22 +72,25 @@ def bybit_request(endpoint, params=None):
         return None
 
 def set_leverage(leverage=LEVERAGE):
-    response = bybit_request("/v5/position/set-leverage", {
+    params = {
         "category": "linear",
         "symbol": SYMBOL,
         "buyLeverage": str(leverage),
         "sellLeverage": str(leverage)
-    })
+    }
+    response = bybit_request("/v5/position/set-leverage", params)
     if response and response.get("retCode") in (0, 110043):
+        log.info(f"Leverage {leverage}x set successfully for {SYMBOL}")
         return True
-    log.error(f"set_leverage error: {response}")
-    return False
+    else:
+        log.error(f"set_leverage error: {response}")
+        return False
 
 def open_position(side, quantity, stop_loss, take_profit):
     if not set_leverage():
-        log.error("Failed to set leverage")
+        log.error("Failed to set leverage, aborting order.")
         return None
-    return bybit_request("/v5/order/create", {
+    params = {
         "category": "linear",
         "symbol": SYMBOL,
         "side": side,
@@ -90,8 +99,12 @@ def open_position(side, quantity, stop_loss, take_profit):
         "timeInForce": "GoodTillCancel",
         "stopLoss": str(round(stop_loss, 2)),
         "takeProfit": str(round(take_profit, 2))
-    })
+    }
+    return bybit_request("/v5/order/create", params)
 
+# ══════════════════════════════════════════════
+# ДАННЫЕ
+# ══════════════════════════════════════════════
 def get_klines(interval="5m", limit=150):
     try:
         url = f"https://api.binance.com/api/v3/klines?symbol={SYMBOL}&interval={interval}&limit={limit}"
@@ -127,112 +140,149 @@ def get_orderbook_imbalance():
         log.error(f"orderbook error: {e}")
         return 0.0
 
+# ══════════════════════════════════════════════
+# ИНДИКАТОРЫ
+# ══════════════════════════════════════════════
 def calc_indicators(df):
     df["EMA9"] = df["close"].ewm(span=9).mean()
     df["EMA21"] = df["close"].ewm(span=21).mean()
     df["EMA50"] = df["close"].ewm(span=50).mean()
+
     delta = df["close"].diff()
     gain = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(com=13, adjust=False).mean()
     df["RSI"] = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
+
     hl = df["high"] - df["low"]
     hpc = (df["high"] - df["close"].shift()).abs()
     lpc = (df["low"] - df["close"].shift()).abs()
     tr = pd.concat([hl, hpc, lpc], axis=1).max(axis=1)
     df["ATR"] = tr.ewm(com=13, adjust=False).mean()
+
     df["VWAP"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
+
     df["BB_mid"] = df["close"].rolling(20).mean()
     std = df["close"].rolling(20).std()
     df["BB_upper"] = df["BB_mid"] + 2 * std
     df["BB_lower"] = df["BB_mid"] - 2 * std
     df["BB_width"] = (df["BB_upper"] - df["BB_lower"]) / df["BB_mid"]
+
     df["vol_avg"] = df["volume"].rolling(20).mean()
     df["vol_spike"] = df["volume"] > df["vol_avg"] * 1.5
+
     df["momentum"] = df["close"] - df["close"].shift(4)
     df["buy_ratio"] = df["taker_buy_base"] / df["volume"].replace(0, np.nan)
+
     return df
 
+# ══════════════════════════════════════════════
+# СИГНАЛ (ПРИНУДИТЕЛЬНЫЙ LONG ДЛЯ ТЕСТА)
+# ══════════════════════════════════════════════
 def get_scalp_signal(df, funding, ob):
     row = df.iloc[-1]
     prev = df.iloc[-2]
     price = row["close"]
     rsi = row["RSI"]
     atr = row["ATR"]
+
     if row["BB_width"] < 0.008:
         return None, None, None, None, None
+
     long_score = 0
     short_score = 0
+
     if row["EMA9"] > row["EMA21"] > row["EMA50"]:
         long_score += 2
     elif row["EMA9"] < row["EMA21"] < row["EMA50"]:
         short_score += 2
+
     if 28 < rsi < 45:
         long_score += 2
     elif 55 < rsi < 72:
         short_score += 2
+
     if price > row["VWAP"]:
         long_score += 1
     else:
         short_score += 1
+
     if price <= row["BB_lower"]:
         long_score += 2
     elif price >= row["BB_upper"]:
         short_score += 2
+
     if row["vol_spike"]:
         long_score += 1
         short_score += 1
+
     if funding < -0.001:
         long_score += 1
     elif funding > 0.003:
         short_score += 1
+
     if ob > 8:
         long_score += 2
     elif ob < -8:
         short_score += 2
+
     if row["momentum"] > 0 and prev["momentum"] > 0:
         long_score += 1
     elif row["momentum"] < 0 and prev["momentum"] < 0:
         short_score += 1
+
     if row["buy_ratio"] > 0.55:
         long_score += 1
     elif row["buy_ratio"] < 0.45:
         short_score += 1
+
     # ══════════════════════════════════════════════
     # ПРИНУДИТЕЛЬНЫЙ СИГНАЛ ДЛЯ ТЕСТА (LONG)
     # ══════════════════════════════════════════════
     long_score = 10
     # ══════════════════════════════════════════════
+
     MAX_SCORE = 13
     THRESHOLD = 7
+
     if long_score >= THRESHOLD:
         entry = price
         stop = round(entry - atr * 0.5, 2)
         tp = round(entry + atr * 1.5, 2)
-        reason = f"Score={long_score}/{MAX_SCORE} | RSI={rsi:.0f} | OB={ob:.1f}% | Fund={funding:.4f}"
+        reason = (f"Score={long_score}/{MAX_SCORE} | RSI={rsi:.0f} | "
+                  f"OB={ob:.1f}% | Fund={funding:.4f}")
         return "LONG", entry, stop, tp, reason
+
     if short_score >= THRESHOLD:
         entry = price
         stop = round(entry + atr * 0.5, 2)
         tp = round(entry - atr * 1.5, 2)
-        reason = f"Score={short_score}/{MAX_SCORE} | RSI={rsi:.0f} | OB={ob:.1f}% | Fund={funding:.4f}"
+        reason = (f"Score={short_score}/{MAX_SCORE} | RSI={rsi:.0f} | "
+                  f"OB={ob:.1f}% | Fund={funding:.4f}")
         return "SHORT", entry, stop, tp, reason
+
     return None, None, None, None, None
 
+# ══════════════════════════════════════════════
+# ОСНОВНОЙ СКАН
+# ══════════════════════════════════════════════
 def run_scan():
     log.info("Scanning...")
     df = get_klines("5m", 150)
     if df is None or df.empty:
         send_telegram("❌ Ошибка получения данных")
         return
+
     df = calc_indicators(df)
     funding = get_funding_rate()
     ob = get_orderbook_imbalance()
     direction, entry, stop, tp, reason = get_scalp_signal(df, funding, ob)
+
     row = df.iloc[-1]
     rsi = row["RSI"]
     price = row["close"]
     atr = row["ATR"]
     bb_width = row["BB_width"]
+
     if direction:
         emoji = "🟢" if direction == "LONG" else "🔴"
         rr = round(abs(tp - entry) / abs(entry - stop), 2)
@@ -247,6 +297,7 @@ def run_scan():
                f"━━━━━━━━━━━━━━━━━━━━\n"
                f"ATR: {atr:.2f} | BB width: {bb_width:.4f}")
         send_telegram(msg)
+
         if BYBIT_API_KEY and BYBIT_API_SECRET:
             side = "Buy" if direction == "LONG" else "Sell"
             order = open_position(side, QTY, stop, tp)
@@ -262,6 +313,9 @@ def run_scan():
                       f"VWAP: {vwap_pos} | OB: {ob:.1f}%\n"
                       f"Fund: {funding:.4f} | ATR: {atr:.2f}")
 
+# ══════════════════════════════════════════════
+# ЗАПУСК
+# ══════════════════════════════════════════════
 def bot_loop():
     send_telegram(f"🚀 Scalp Bot запущен\n"
                   f"Символ: {SYMBOL} | Интервал: {SCAN_INTERVAL // 60} мин\n"
