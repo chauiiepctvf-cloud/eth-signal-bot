@@ -1,9 +1,11 @@
+
 import os
 import time
 import logging
 import threading
 import hashlib
 import hmac
+import json
 import requests
 import pandas as pd
 import numpy as np
@@ -11,325 +13,105 @@ from datetime import datetime
 from flask import Flask
 
 # ══════════════════════════════════════════════
+
 # НАСТРОЙКИ
+
 # ══════════════════════════════════════════════
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
-SYMBOL = "ETHUSDT"
-SCAN_INTERVAL = 5 * 60                     # 5 минут для скальпинга
 
-BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY")
-BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET")
-BYBIT_BASE_URL = "https://api-testnet.bybit.com"
-LEVERAGE = 10
-QTY = 0.01
+TELEGRAM_TOKEN   = os.environ.get(“TELEGRAM_TOKEN”)
+CHAT_ID          = os.environ.get(“CHAT_ID”)
+SYMBOL           = “ETHUSDT”
+SCAN_INTERVAL    = 5 * 60
 
-logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
-log = logging.getLogger(__name__)
+BYBIT_API_KEY    = os.environ.get(“BYBIT_API_KEY”)
+BYBIT_API_SECRET = os.environ.get(“BYBIT_API_SECRET”)
 
-app = Flask(__name__)
+# ⚠️ Для теста — testnet. Когда готов к реальной торговле:
 
-@app.route("/")
+# замени на https://api.bybit.com
+
+BYBIT_BASE_URL   = “https://api-testnet.bybit.com”
+
+LEVERAGE         = 10
+QTY              = 0.01      # количество ETH на сделку
+MIN_SCORE        = 7         # минимальный балл для входа
+MAX_SCORE        = 13        # максимально возможный балл
+
+logging.basicConfig(format=”%(asctime)s [%(levelname)s] %(message)s”, level=logging.INFO)
+log = logging.getLogger(**name**)
+
+app = Flask(**name**)
+
+@app.route(”/”)
 def home():
-    return f"Scalp Bot works | {datetime.now().strftime('%d.%m.%Y %H:%M')} UTC"
+return f”Scalp Bot | {datetime.utcnow().strftime(’%d.%m.%Y %H:%M’)} UTC”
 
 # ══════════════════════════════════════════════
+
 # TELEGRAM
+
 # ══════════════════════════════════════════════
+
 def send_telegram(text):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        log.error("TELEGRAM_TOKEN or CHAT_ID not set!")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        r = requests.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=15)
-        if r.status_code == 200:
-            log.info("Telegram: message sent")
-        else:
-            log.error(f"Telegram failed: {r.text}")
-    except Exception as e:
-        log.error(f"Telegram error: {e}")
+if not TELEGRAM_TOKEN or not CHAT_ID:
+log.error(“TELEGRAM_TOKEN или CHAT_ID не заданы”)
+return
+try:
+r = requests.post(
+f”https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage”,
+json={“chat_id”: CHAT_ID, “text”: text, “parse_mode”: “HTML”},
+timeout=15
+)
+if r.status_code == 200:
+log.info(“Telegram ✅”)
+else:
+log.error(f”Telegram ошибка: {r.text}”)
+except Exception as e:
+log.error(f”Telegram: {e}”)
 
 # ══════════════════════════════════════════════
-# BYBIT API (ИСПРАВЛЕННЫЕ ФУНКЦИИ)
-# ══════════════════════════════════════════════
-def bybit_request(endpoint, params=None):
-    if not BYBIT_API_KEY or not BYBIT_API_SECRET:
-        return None
-    timestamp = int(time.time() * 10**3)
-    if params is None:
-        params = {}
-    params["api_key"] = BYBIT_API_KEY
-    params["timestamp"] = timestamp
-    param_str = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
-    signature = hmac.new(BYBIT_API_SECRET.encode(), param_str.encode(), hashlib.sha256).hexdigest()
-    params["sign"] = signature
-    url = f"{BYBIT_BASE_URL}{endpoint}"
-    try:
-        return requests.post(url, data=params, timeout=10).json()
-    except Exception as e:
-        log.error(f"Bybit error: {e}")
-        return None
 
-def set_leverage(leverage=LEVERAGE):
-    params = {
-        "category": "linear",
-        "symbol": SYMBOL,
-        "buyLeverage": str(leverage),
-        "sellLeverage": str(leverage)
-    }
-    response = bybit_request("/v5/position/set-leverage", params)
-    if response and response.get("retCode") in (0, 110043):
-        log.info(f"Leverage {leverage}x set successfully for {SYMBOL}")
-        return True
-    else:
-        log.error(f"set_leverage error: {response}")
-        return False
-
-def open_position(side, quantity, stop_loss, take_profit):
-    if not set_leverage():
-        log.error("Failed to set leverage, aborting order.")
-        return None
-    params = {
-        "category": "linear",
-        "symbol": SYMBOL,
-        "side": side,
-        "orderType": "Market",
-        "qty": str(quantity),
-        "timeInForce": "GoodTillCancel",
-        "stopLoss": str(round(stop_loss, 2)),
-        "takeProfit": str(round(take_profit, 2))
-    }
-    return bybit_request("/v5/order/create", params)
+# BYBIT V5 API — ПРАВИЛЬНАЯ ПОДПИСЬ
 
 # ══════════════════════════════════════════════
-# ДАННЫЕ
-# ══════════════════════════════════════════════
-def get_klines(interval="5m", limit=150):
-    try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={SYMBOL}&interval={interval}&limit={limit}"
-        data = requests.get(url, timeout=10).json()
-        df = pd.DataFrame(data, columns=[
-            "time", "open", "high", "low", "close", "volume",
-            "close_time", "quote_vol", "trades",
-            "taker_buy_base", "taker_buy_quote", "ignore"
-        ])
-        for c in ("open", "high", "low", "close", "volume", "taker_buy_base"):
-            df[c] = df[c].astype(float)
-        return df
-    except Exception as e:
-        log.error(f"get_klines error: {e}")
-        return None
 
-def get_funding_rate():
-    try:
-        data = requests.get(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={SYMBOL}", timeout=10).json()
-        return float(data["lastFundingRate"])
-    except Exception as e:
-        log.error(f"funding error: {e}")
-        return 0.0
+RECV_WINDOW = “5000”
 
-def get_orderbook_imbalance():
-    try:
-        data = requests.get(f"https://api.binance.com/api/v3/depth?symbol={SYMBOL}&limit=20", timeout=10).json()
-        bids = sum(float(b[1]) for b in data["bids"])
-        asks = sum(float(a[1]) for a in data["asks"])
-        total = bids + asks
-        return round((bids - asks) / total * 100, 1) if total else 0.0
-    except Exception as e:
-        log.error(f"orderbook error: {e}")
-        return 0.0
+def _sign(secret: str, payload: str) -> str:
+return hmac.new(secret.encode(“utf-8”), payload.encode(“utf-8”), hashlib.sha256).hexdigest()
 
-# ══════════════════════════════════════════════
-# ИНДИКАТОРЫ
-# ══════════════════════════════════════════════
-def calc_indicators(df):
-    df["EMA9"] = df["close"].ewm(span=9).mean()
-    df["EMA21"] = df["close"].ewm(span=21).mean()
-    df["EMA50"] = df["close"].ewm(span=50).mean()
+def bybit_post(endpoint: str, body: dict) -> dict:
+“”“POST запрос к Bybit V5 с правильной подписью.”””
+if not BYBIT_API_KEY or not BYBIT_API_SECRET:
+log.error(“Bybit ключи не заданы!”)
+return {}
+ts        = str(int(time.time() * 1000))
+body_str  = json.dumps(body)
+# Строка для подписи: timestamp + api_key + recv_window + body
+sign_str  = ts + BYBIT_API_KEY + RECV_WINDOW + body_str
+signature = _sign(BYBIT_API_SECRET, sign_str)
 
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(com=13, adjust=False).mean()
-    df["RSI"] = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
+headers = {
+    "X-BAPI-API-KEY":         BYBIT_API_KEY,
+    "X-BAPI-SIGN":            signature,
+    "X-BAPI-SIGN-TYPE":       "2",
+    "X-BAPI-TIMESTAMP":       ts,
+    "X-BAPI-RECV-WINDOW":     RECV_WINDOW,
+    "Content-Type":           "application/json",
+}
 
-    hl = df["high"] - df["low"]
-    hpc = (df["high"] - df["close"].shift()).abs()
-    lpc = (df["low"] - df["close"].shift()).abs()
-    tr = pd.concat([hl, hpc, lpc], axis=1).max(axis=1)
-    df["ATR"] = tr.ewm(com=13, adjust=False).mean()
+try:
+    r = requests.post(
+        BYBIT_BASE_URL + endpoint,
+        headers=headers,
+        data=body_str,
+        timeout=10
+    )
+    data = r.json()
+    log.info(f"Bybit {endpoint}: {data}")
+    return data
+except Exception as e:
+    log.error(f"Bybit POST {endpoint}: {e}")
+    return {}
 
-    df["VWAP"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
-
-    df["BB_mid"] = df["close"].rolling(20).mean()
-    std = df["close"].rolling(20).std()
-    df["BB_upper"] = df["BB_mid"] + 2 * std
-    df["BB_lower"] = df["BB_mid"] - 2 * std
-    df["BB_width"] = (df["BB_upper"] - df["BB_lower"]) / df["BB_mid"]
-
-    df["vol_avg"] = df["volume"].rolling(20).mean()
-    df["vol_spike"] = df["volume"] > df["vol_avg"] * 1.5
-
-    df["momentum"] = df["close"] - df["close"].shift(4)
-    df["buy_ratio"] = df["taker_buy_base"] / df["volume"].replace(0, np.nan)
-
-    return df
-
-# ══════════════════════════════════════════════
-# СИГНАЛ (ПРИНУДИТЕЛЬНЫЙ LONG ДЛЯ ТЕСТА)
-# ══════════════════════════════════════════════
-def get_scalp_signal(df, funding, ob):
-    row = df.iloc[-1]
-    prev = df.iloc[-2]
-    price = row["close"]
-    rsi = row["RSI"]
-    atr = row["ATR"]
-
-    if row["BB_width"] < 0.008:
-        return None, None, None, None, None
-
-    long_score = 0
-    short_score = 0
-
-    if row["EMA9"] > row["EMA21"] > row["EMA50"]:
-        long_score += 2
-    elif row["EMA9"] < row["EMA21"] < row["EMA50"]:
-        short_score += 2
-
-    if 28 < rsi < 45:
-        long_score += 2
-    elif 55 < rsi < 72:
-        short_score += 2
-
-    if price > row["VWAP"]:
-        long_score += 1
-    else:
-        short_score += 1
-
-    if price <= row["BB_lower"]:
-        long_score += 2
-    elif price >= row["BB_upper"]:
-        short_score += 2
-
-    if row["vol_spike"]:
-        long_score += 1
-        short_score += 1
-
-    if funding < -0.001:
-        long_score += 1
-    elif funding > 0.003:
-        short_score += 1
-
-    if ob > 8:
-        long_score += 2
-    elif ob < -8:
-        short_score += 2
-
-    if row["momentum"] > 0 and prev["momentum"] > 0:
-        long_score += 1
-    elif row["momentum"] < 0 and prev["momentum"] < 0:
-        short_score += 1
-
-    if row["buy_ratio"] > 0.55:
-        long_score += 1
-    elif row["buy_ratio"] < 0.45:
-        short_score += 1
-
-    # ══════════════════════════════════════════════
-    # ПРИНУДИТЕЛЬНЫЙ СИГНАЛ ДЛЯ ТЕСТА (LONG)
-    # ══════════════════════════════════════════════
-    long_score = 10
-    # ══════════════════════════════════════════════
-
-    MAX_SCORE = 13
-    THRESHOLD = 7
-
-    if long_score >= THRESHOLD:
-        entry = price
-        stop = round(entry - atr * 0.5, 2)
-        tp = round(entry + atr * 1.5, 2)
-        reason = (f"Score={long_score}/{MAX_SCORE} | RSI={rsi:.0f} | "
-                  f"OB={ob:.1f}% | Fund={funding:.4f}")
-        return "LONG", entry, stop, tp, reason
-
-    if short_score >= THRESHOLD:
-        entry = price
-        stop = round(entry + atr * 0.5, 2)
-        tp = round(entry - atr * 1.5, 2)
-        reason = (f"Score={short_score}/{MAX_SCORE} | RSI={rsi:.0f} | "
-                  f"OB={ob:.1f}% | Fund={funding:.4f}")
-        return "SHORT", entry, stop, tp, reason
-
-    return None, None, None, None, None
-
-# ══════════════════════════════════════════════
-# ОСНОВНОЙ СКАН
-# ══════════════════════════════════════════════
-def run_scan():
-    log.info("Scanning...")
-    df = get_klines("5m", 150)
-    if df is None or df.empty:
-        send_telegram("❌ Ошибка получения данных")
-        return
-
-    df = calc_indicators(df)
-    funding = get_funding_rate()
-    ob = get_orderbook_imbalance()
-    direction, entry, stop, tp, reason = get_scalp_signal(df, funding, ob)
-
-    row = df.iloc[-1]
-    rsi = row["RSI"]
-    price = row["close"]
-    atr = row["ATR"]
-    bb_width = row["BB_width"]
-
-    if direction:
-        emoji = "🟢" if direction == "LONG" else "🔴"
-        rr = round(abs(tp - entry) / abs(entry - stop), 2)
-        msg = (f"{emoji} SCALP SIGNAL — {direction}\n"
-               f"━━━━━━━━━━━━━━━━━━━━\n"
-               f" Entry: {entry:.2f}\n"
-               f" Stop: {stop:.2f}\n"
-               f" TP: {tp:.2f}\n"
-               f" R/R: 1:{rr}\n"
-               f"━━━━━━━━━━━━━━━━━━━━\n"
-               f" {reason}\n"
-               f"━━━━━━━━━━━━━━━━━━━━\n"
-               f"ATR: {atr:.2f} | BB width: {bb_width:.4f}")
-        send_telegram(msg)
-
-        if BYBIT_API_KEY and BYBIT_API_SECRET:
-            side = "Buy" if direction == "LONG" else "Sell"
-            order = open_position(side, QTY, stop, tp)
-            if order and order.get("retCode") == 0:
-                send_telegram(f"✅ Ордер отправлен: {direction} {QTY} {SYMBOL}")
-            else:
-                send_telegram(f"❌ Ошибка ордера: {order}")
-    else:
-        vwap_pos = "выше" if price > row["VWAP"] else "ниже"
-        trend = "▲" if row["EMA9"] > row["EMA21"] else "▼"
-        send_telegram(f"🟡 ОЖИДАНИЕ {trend}\n"
-                      f"Price: {price:.2f} | RSI: {rsi:.0f}\n"
-                      f"VWAP: {vwap_pos} | OB: {ob:.1f}%\n"
-                      f"Fund: {funding:.4f} | ATR: {atr:.2f}")
-
-# ══════════════════════════════════════════════
-# ЗАПУСК
-# ══════════════════════════════════════════════
-def bot_loop():
-    send_telegram(f"🚀 Scalp Bot запущен\n"
-                  f"Символ: {SYMBOL} | Интервал: {SCAN_INTERVAL // 60} мин\n"
-                  f"Плечо: {LEVERAGE}x | Объём: {QTY}")
-    while True:
-        try:
-            run_scan()
-        except Exception as e:
-            log.error(f"Loop error: {e}")
-            send_telegram(f"❌ Ошибка бота: {e}")
-        time.sleep(SCAN_INTERVAL)
-
-if __name__ == "__main__":
-    t = threading.Thread(target=bot_loop, daemon=True)
-    t.start()
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+def bybit_get(endpoint: str, params: dict = None) -> dict:
