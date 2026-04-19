@@ -72,14 +72,19 @@ def bybit_request(endpoint, params=None):
         return None
 
 def set_leverage(leverage=LEVERAGE):
-    return bybit_request("/v5/position/set-leverage", {
+    response = bybit_request("/v5/position/set-leverage", {
         "symbol": SYMBOL,
         "buyLeverage": str(leverage),
         "sellLeverage": str(leverage)
     })
+    if response and response.get("retCode") in (0, 110043):
+        return True
+    return False
 
 def open_position(side, quantity, stop_loss, take_profit):
-    set_leverage()
+    if not set_leverage():
+        log.error("Failed to set leverage")
+        return None
     return bybit_request("/v5/order/create", {
         "symbol": SYMBOL,
         "side": side,
@@ -129,51 +134,42 @@ def get_orderbook_imbalance():
         return 0.0
 
 # ══════════════════════════════════════════════
-# ИНДИКАТОРЫ (улучшено для скальпинга)
+# ИНДИКАТОРЫ
 # ══════════════════════════════════════════════
 def calc_indicators(df):
-    # EMA — быстрее MA, лучше для скальпинга
     df["EMA9"] = df["close"].ewm(span=9).mean()
     df["EMA21"] = df["close"].ewm(span=21).mean()
     df["EMA50"] = df["close"].ewm(span=50).mean()
 
-    # RSI
     delta = df["close"].diff()
     gain = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(com=13, adjust=False).mean()
     df["RSI"] = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
 
-    # ATR
     hl = df["high"] - df["low"]
     hpc = (df["high"] - df["close"].shift()).abs()
     lpc = (df["low"] - df["close"].shift()).abs()
     tr = pd.concat([hl, hpc, lpc], axis=1).max(axis=1)
     df["ATR"] = tr.ewm(com=13, adjust=False).mean()
 
-    # VWAP
     df["VWAP"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
 
-    # Bollinger Bands
     df["BB_mid"] = df["close"].rolling(20).mean()
     std = df["close"].rolling(20).std()
     df["BB_upper"] = df["BB_mid"] + 2 * std
     df["BB_lower"] = df["BB_mid"] - 2 * std
     df["BB_width"] = (df["BB_upper"] - df["BB_lower"]) / df["BB_mid"]
 
-    # Объём
     df["vol_avg"] = df["volume"].rolling(20).mean()
     df["vol_spike"] = df["volume"] > df["vol_avg"] * 1.5
 
-    # Momentum
     df["momentum"] = df["close"] - df["close"].shift(4)
-
-    # Taker buy ratio (давление покупателей)
     df["buy_ratio"] = df["taker_buy_base"] / df["volume"].replace(0, np.nan)
 
     return df
 
 # ══════════════════════════════════════════════
-# СИГНАЛ (скоринг система)
+# СИГНАЛ (с принудительным LONG для теста)
 # ══════════════════════════════════════════════
 def get_scalp_signal(df, funding, ob):
     row = df.iloc[-1]
@@ -182,67 +178,62 @@ def get_scalp_signal(df, funding, ob):
     rsi = row["RSI"]
     atr = row["ATR"]
 
-    # Фильтр: не торгуем при слишком узком рынке
     if row["BB_width"] < 0.008:
         return None, None, None, None, None
 
     long_score = 0
     short_score = 0
 
-    # 1. EMA тренд (макс 2 очка)
     if row["EMA9"] > row["EMA21"] > row["EMA50"]:
         long_score += 2
     elif row["EMA9"] < row["EMA21"] < row["EMA50"]:
         short_score += 2
 
-    # 2. RSI (макс 2 очка)
     if 28 < rsi < 45:
         long_score += 2
     elif 55 < rsi < 72:
         short_score += 2
 
-    # 3. VWAP (макс 1 очко)
     if price > row["VWAP"]:
         long_score += 1
     else:
         short_score += 1
 
-    # 4. Bollinger Bands (макс 2 очка)
     if price <= row["BB_lower"]:
         long_score += 2
     elif price >= row["BB_upper"]:
         short_score += 2
 
-    # 5. Объём (макс 1 очко)
     if row["vol_spike"]:
         long_score += 1
         short_score += 1
 
-    # 6. Funding rate (макс 1 очко)
     if funding < -0.001:
         long_score += 1
     elif funding > 0.003:
         short_score += 1
 
-    # 7. Order book (макс 2 очка)
     if ob > 8:
         long_score += 2
     elif ob < -8:
         short_score += 2
 
-    # 8. Momentum (макс 1 очко)
     if row["momentum"] > 0 and prev["momentum"] > 0:
         long_score += 1
     elif row["momentum"] < 0 and prev["momentum"] < 0:
         short_score += 1
 
-    # 9. Taker buy ratio (макс 1 очко)
     if row["buy_ratio"] > 0.55:
         long_score += 1
     elif row["buy_ratio"] < 0.45:
         short_score += 1
 
-    # Итого макс = 13 очков, порог = 7
+    # ══════════════════════════════════════════════
+    # ПРИНУДИТЕЛЬНЫЙ СИГНАЛ ДЛЯ ТЕСТА (LONG)
+    # ══════════════════════════════════════════════
+    long_score = 10   # ← УБЕРИ ЭТУ СТРОКУ ПОСЛЕ ТЕСТА
+    # ══════════════════════════════════════════════
+
     MAX_SCORE = 13
     THRESHOLD = 7
 
@@ -305,13 +296,13 @@ def run_scan():
         send_telegram(msg)
 
         if BYBIT_API_KEY and BYBIT_API_SECRET:
-            order = open_position("Buy" if direction == "LONG" else "Sell", QTY, stop, tp)
+            side = "Buy" if direction == "LONG" else "Sell"
+            order = open_position(side, QTY, stop, tp)
             if order and order.get("retCode") == 0:
                 send_telegram(f"✅ Ордер отправлен: {direction} {QTY} {SYMBOL}")
             else:
                 send_telegram(f"❌ Ошибка ордера: {order}")
     else:
-        # Статус без сигнала
         vwap_pos = "выше" if price > row["VWAP"] else "ниже"
         trend = "▲" if row["EMA9"] > row["EMA21"] else "▼"
         send_telegram(f"🟡 ОЖИДАНИЕ {trend}\n"
