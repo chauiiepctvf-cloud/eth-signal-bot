@@ -13,12 +13,11 @@ from flask import Flask
 # ══════════════════════════════════════════════
 # НАСТРОЙКИ
 # ══════════════════════════════════════════════
-TELEGRAM_TOKEN = os.environ.get("8227282003:AAGlF5GMA5DoovMbxOY4UfIXbpmy96-ITp8")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 SYMBOL = "ETHUSDT"
-SCAN_INTERVAL = 30 * 60  # 30 минут
+SCAN_INTERVAL = 30 * 60
 
-# Bybit Testnet
 BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY")
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET")
 BYBIT_BASE_URL = "https://api-testnet.bybit.com"
@@ -30,26 +29,33 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return f"Scalp Bot работает | {datetime.now().strftime('%d.%m.%Y %H:%M')} UTC"
+    return f"Scalp Bot works | {datetime.now().strftime('%d.%m.%Y %H:%M')} UTC"
 
 # ══════════════════════════════════════════════
-# TELEGRAM (без HTML)
+# TELEGRAM
 # ══════════════════════════════════════════════
 def send_telegram(text):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        log.error("TELEGRAM_TOKEN or CHAT_ID not set!")
+        return
+    
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         r = requests.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=15)
+        log.info(f"Telegram response: {r.status_code} - {r.text[:200]}")
         if r.status_code == 200:
-            log.info("Сообщение отправлено")
+            log.info("Message sent")
         else:
-            log.error(f"Ошибка: {r.text}")
+            log.error(f"Failed: {r.text}")
     except Exception as e:
-        log.error(f"Telegram: {e}")
+        log.error(f"Telegram error: {e}")
 
 # ══════════════════════════════════════════════
 # BYBIT API
 # ══════════════════════════════════════════════
 def bybit_request(endpoint, params=None):
+    if not BYBIT_API_KEY or not BYBIT_API_SECRET:
+        return None
     timestamp = int(time.time() * 10**3)
     if params is None:
         params = {}
@@ -108,20 +114,15 @@ def get_orderbook_imbalance():
 
 def calc_indicators(df):
     df["MA50"] = df["close"].rolling(50).mean()
-    df["EMA9"] = df["close"].ewm(span=9, adjust=False).mean()
-    df["EMA21"] = df["close"].ewm(span=21, adjust=False).mean()
-    
     delta = df["close"].diff()
     gain = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(com=13, adjust=False).mean()
     df["RSI"] = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
-    
     hl = df["high"] - df["low"]
     hpc = (df["high"] - df["close"].shift()).abs()
     lpc = (df["low"] - df["close"].shift()).abs()
     tr = pd.concat([hl, hpc, lpc], axis=1).max(axis=1)
     df["ATR"] = tr.ewm(com=13, adjust=False).mean()
-    
     df["vol_avg"] = df["volume"].rolling(20).mean()
     df["vol_spike"] = df["volume"] > df["vol_avg"] * 1.3
     return df
@@ -138,19 +139,19 @@ def get_scalp_signal(df, funding, ob):
         entry = price
         stop = entry - atr * 0.6
         tp = entry + atr * 1.2
-        reason = f"RSI={rsi:.0f}, volume high, orderbook +{ob:.0f}%"
+        reason = f"RSI={rsi:.0f}, vol high, book +{ob:.0f}%"
         return direction, entry, stop, tp, reason
     elif price < row["MA50"] and rsi > 60 and funding > 0.003 and vol_ok and ob < -5:
         direction = "SHORT"
         entry = price
         stop = entry + atr * 0.6
         tp = entry - atr * 1.2
-        reason = f"RSI={rsi:.0f}, volume high, orderbook {ob:.0f}%"
+        reason = f"RSI={rsi:.0f}, vol high, book {ob:.0f}%"
         return direction, entry, stop, tp, reason
     return None, None, None, None, None
 
 def run_scan():
-    log.info("Сканирование...")
+    log.info("Scanning...")
     df = get_klines("15m", 100)
     if df is None:
         send_telegram("Data error")
@@ -164,10 +165,7 @@ def run_scan():
         send_telegram(msg)
         if BYBIT_API_KEY and BYBIT_API_SECRET:
             qty = 0.01
-            if direction == "LONG":
-                order = open_position("Buy", qty, stop, tp)
-            else:
-                order = open_position("Sell", qty, stop, tp)
+            order = open_position("Buy" if direction == "LONG" else "Sell", qty, stop, tp)
             if order and order.get("retCode") == 0:
                 send_telegram(f"Order sent: {direction}")
             else:
