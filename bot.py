@@ -21,7 +21,7 @@ OKX_API_KEY = os.environ.get("OKX_API_KEY")
 OKX_SECRET = os.environ.get("OKX_SECRET")
 OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE")
 OKX_BASE = "https://www.okx.com"
-OKX_DEMO_HEADER = {"x-simulated-trading": "1"}  # демо-режим
+OKX_DEMO_HEADER = {"x-simulated-trading": "1"}
 SYMBOL = "ETH-USDT-SWAP"
 SYMBOL_BN = "ETHUSDT"
 LEVERAGE = 5
@@ -40,9 +40,6 @@ app = Flask(__name__)
 def home():
     return f"OKX Scalp Bot | {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC"
 
-# ══════════════════════════════════════════════
-# TELEGRAM
-# ══════════════════════════════════════════════
 def send_telegram(text: str):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         log.error("TELEGRAM_TOKEN или CHAT_ID не заданы")
@@ -139,11 +136,39 @@ def okx_get_positions() -> list:
     return [p for p in r.get("data", []) if float(p.get("pos", 0)) != 0]
 
 def okx_place_order(direction: str, entry: float, sl: float, tp: float) -> dict:
+    """Открывает ордер с TP/SL через attachAlgoOrds (новый формат OKX)"""
     okx_set_leverage()
     side = "buy" if direction == "LONG" else "sell"
     pos_side = "long" if direction == "LONG" else "short"
     contract_size = 0.01
     qty = max(1, round(ORDER_USDT * LEVERAGE / entry / contract_size))
+    
+    # Основной ордер
+    order_body = {
+        "instId": SYMBOL,
+        "tdMode": "cross",
+        "side": side,
+        "posSide": pos_side,
+        "ordType": "market",
+        "sz": str(qty),
+    }
+    
+    # TP/SL через attachAlgoOrds
+    attach_algo = [
+        {
+            "attachAlgoClOrdId": f"tp_{int(time.time())}",
+            "tpTriggerPx": str(round(tp, 2)),
+            "tpOrdPx": "-1",
+            "tpTriggerPxType": "last",
+        },
+        {
+            "attachAlgoClOrdId": f"sl_{int(time.time())}",
+            "slTriggerPx": str(round(sl, 2)),
+            "slOrdPx": "-1",
+            "slTriggerPxType": "last",
+        }
+    ]
+    
     body = {
         "instId": SYMBOL,
         "tdMode": "cross",
@@ -151,13 +176,9 @@ def okx_place_order(direction: str, entry: float, sl: float, tp: float) -> dict:
         "posSide": pos_side,
         "ordType": "market",
         "sz": str(qty),
-        "tpTriggerPx": str(round(tp, 2)),
-        "tpOrdPx": "-1",
-        "slTriggerPx": str(round(sl, 2)),
-        "slOrdPx": "-1",
-        "tpTriggerPxType": "last",
-        "slTriggerPxType": "last",
+        "attachAlgoOrds": attach_algo,
     }
+    
     r = okx_post("/api/v5/trade/order", body)
     code = r.get("code", "-1")
     if code == "0":
@@ -306,7 +327,6 @@ def get_scalp_signal(df, funding, ob, force_test=False):
     elif row["buy_ratio"] < 0.45:
         short_s += 1
 
-    # ПРИНУДИТЕЛЬНЫЙ СИГНАЛ ДЛЯ ТЕСТА
     if force_test:
         long_s = 10
 
@@ -344,9 +364,6 @@ def get_scalp_signal(df, funding, ob, force_test=False):
               f"OB {ob:+.1f}% | Fund {funding:.5f} | ATR {atr:.2f}")
     return direction, entry, sl, tp, score, reason
 
-# ══════════════════════════════════════════════
-# ШКАЛА БАЛЛОВ
-# ══════════════════════════════════════════════
 def score_bar(score) -> str:
     pct = score / MAX_SCORE
     filled = round(pct * 10)
@@ -359,9 +376,6 @@ def score_bar(score) -> str:
         emoji = "🔴"
     return f"{emoji} [{bar}] {score}/{MAX_SCORE}"
 
-# ══════════════════════════════════════════════
-# ГЛАВНЫЙ ЦИКЛ
-# ══════════════════════════════════════════════
 last_trade_time = 0
 
 def run_scan(force_test=False):
@@ -452,7 +466,6 @@ def bot_loop():
 
     while True:
         try:
-            # ПРИНУДИТЕЛЬНЫЙ ТЕСТ (force_test = True)
             run_scan(force_test=True)
         except Exception as e:
             log.error(f"Ошибка: {e}")
