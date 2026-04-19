@@ -4,31 +4,32 @@ import logging
 import threading
 import hashlib
 import hmac
+import base64
 import json
 import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timezone
 from flask import Flask
 
 # ══════════════════════════════════════════════
 # НАСТРОЙКИ
 # ══════════════════════════════════════════════
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN")
-CHAT_ID          = os.environ.get("CHAT_ID")
-SYMBOL           = "ETHUSDT"
-SCAN_INTERVAL    = 5 * 60
-
-BYBIT_API_KEY    = os.environ.get("BYBIT_API_KEY")
-BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET")
-BYBIT_BASE_URL   = "https://api-testnet.bybit.com"
-
-LEVERAGE         = 10
-QTY              = 0.01
-MIN_SCORE        = 7
-MAX_SCORE        = 13
-
-FORCE_TEST       = True   # принудительный сигнал
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+CHAT_ID = os.environ.get("CHAT_ID")
+OKX_API_KEY = os.environ.get("OKX_API_KEY")
+OKX_SECRET = os.environ.get("OKX_SECRET")
+OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE")
+OKX_BASE = "https://www.okx.com"
+OKX_DEMO_HEADER = {"x-simulated-trading": "1"}  # демо-режим
+SYMBOL = "ETH-USDT-SWAP"
+SYMBOL_BN = "ETHUSDT"
+LEVERAGE = 5
+ORDER_USDT = 20
+MIN_SCORE = 7
+MAX_SCORE = 13
+SCAN_INTERVAL = 5 * 60
+COOLDOWN = 15 * 60
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -37,9 +38,12 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return f"Scalp Bot | {datetime.utcnow().strftime('%d.%m.%Y %H:%M')} UTC"
+    return f"OKX Scalp Bot | {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC"
 
-def send_telegram(text):
+# ══════════════════════════════════════════════
+# TELEGRAM
+# ══════════════════════════════════════════════
+def send_telegram(text: str):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         log.error("TELEGRAM_TOKEN или CHAT_ID не заданы")
         return
@@ -52,146 +56,128 @@ def send_telegram(text):
         if r.status_code == 200:
             log.info("Telegram ✅")
         else:
-            log.error(f"Telegram ошибка: {r.text}")
+            log.error(f"Telegram: {r.text}")
     except Exception as e:
         log.error(f"Telegram: {e}")
 
 # ══════════════════════════════════════════════
-# BYBIT V5 API
+# OKX API — ПОДПИСЬ
 # ══════════════════════════════════════════════
-RECV_WINDOW = "5000"
-
-def _sign(secret: str, payload: str) -> str:
-    return hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
-
-def bybit_post(endpoint: str, body: dict) -> dict:
-    if not BYBIT_API_KEY or not BYBIT_API_SECRET:
-        log.error("Bybit ключи не заданы!")
-        return {}
-    ts = str(int(time.time() * 1000))
-    body_str = json.dumps(body)
-    sign_str = ts + BYBIT_API_KEY + RECV_WINDOW + body_str
-    signature = _sign(BYBIT_API_SECRET, sign_str)
-
+def _okx_sign(timestamp: str, method: str, path: str, body: str = "") -> dict:
+    message = timestamp + method.upper() + path + body
+    signature = base64.b64encode(
+        hmac.new(
+            OKX_SECRET.encode("utf-8"),
+            message.encode("utf-8"),
+            hashlib.sha256
+        ).digest()
+    ).decode()
     headers = {
-        "X-BAPI-API-KEY": BYBIT_API_KEY,
-        "X-BAPI-SIGN": signature,
-        "X-BAPI-SIGN-TYPE": "2",
-        "X-BAPI-TIMESTAMP": ts,
-        "X-BAPI-RECV-WINDOW": RECV_WINDOW,
+        "OK-ACCESS-KEY": OKX_API_KEY,
+        "OK-ACCESS-SIGN": signature,
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": OKX_PASSPHRASE,
         "Content-Type": "application/json",
     }
+    headers.update(OKX_DEMO_HEADER)
+    return headers
 
+def okx_get(path: str, params: dict = None) -> dict:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    qs = ""
+    if params:
+        qs = "?" + "&".join(f"{k}={v}" for k, v in params.items())
+    hdr = _okx_sign(ts, "GET", path + qs)
     try:
-        r = requests.post(BYBIT_BASE_URL + endpoint, headers=headers, data=body_str, timeout=10)
-        data = r.json()
-        log.info(f"Bybit {endpoint}: {data}")
-        return data
-    except Exception as e:
-        log.error(f"Bybit POST {endpoint}: {e}")
-        return {}
-
-def bybit_get(endpoint: str, params: dict = None) -> dict:
-    if not BYBIT_API_KEY or not BYBIT_API_SECRET:
-        return {}
-    if params is None:
-        params = {}
-    ts = str(int(time.time() * 1000))
-    query_str = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-    sign_str = ts + BYBIT_API_KEY + RECV_WINDOW + query_str
-    signature = _sign(BYBIT_API_SECRET, sign_str)
-
-    headers = {
-        "X-BAPI-API-KEY": BYBIT_API_KEY,
-        "X-BAPI-SIGN": signature,
-        "X-BAPI-SIGN-TYPE": "2",
-        "X-BAPI-TIMESTAMP": ts,
-        "X-BAPI-RECV-WINDOW": RECV_WINDOW,
-    }
-
-    try:
-        r = requests.get(BYBIT_BASE_URL + endpoint, headers=headers, params=params, timeout=10)
+        r = requests.get(OKX_BASE + path + qs, headers=hdr, timeout=10)
         return r.json()
     except Exception as e:
-        log.error(f"Bybit GET {endpoint}: {e}")
+        log.error(f"OKX GET {path}: {e}")
         return {}
 
-def set_leverage(leverage: int = LEVERAGE) -> bool:
-    body = {
-        "category": "linear",
-        "symbol": SYMBOL,
-        "buyLeverage": str(leverage),
-        "sellLeverage": str(leverage),
-    }
-    r = bybit_post("/v5/position/set-leverage", body)
-    code = r.get("retCode", -1)
-    if code == 0:
-        log.info(f"Плечо x{leverage} установлено ✅")
-        return True
-    elif code == 110043:
-        log.info(f"Плечо уже x{leverage} — ОК")
-        return True
-    else:
-        log.error(f"set_leverage ошибка: {r.get('retMsg')} (код {code})")
-        return False
-
-def switch_to_one_way_mode() -> bool:
-    body = {
-        "category": "linear",
-        "symbol": SYMBOL,
-        "mode": 0,
-    }
-    r = bybit_post("/v5/position/switch-mode", body)
-    code = r.get("retCode", -1)
-    if code in (0, 110025):
-        log.info("One-way mode ✅")
-        return True
-    else:
-        log.warning(f"switch_mode: {r.get('retMsg')} ({code}) — продолжаем")
-        return True
-
-def get_open_positions() -> list:
-    r = bybit_get("/v5/position/list", {"category": "linear", "symbol": SYMBOL})
-    positions = r.get("result", {}).get("list", [])
-    return [p for p in positions if float(p.get("size", 0)) > 0]
-
-def get_balance() -> float:
-    r = bybit_get("/v5/account/wallet-balance", {"accountType": "CONTRACT"})
+def okx_post(path: str, body: dict) -> dict:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    data = json.dumps(body)
+    hdr = _okx_sign(ts, "POST", path, data)
     try:
-        coins = r["result"]["list"][0]["coin"]
-        for c in coins:
-            if c["coin"] == "USDT":
-                return float(c["availableToWithdraw"])
+        r = requests.post(OKX_BASE + path, headers=hdr, data=data, timeout=10)
+        d = r.json()
+        log.info(f"OKX POST {path}: {d}")
+        return d
+    except Exception as e:
+        log.error(f"OKX POST {path}: {e}")
+        return {}
+
+# ══════════════════════════════════════════════
+# OKX — ТОРГОВЫЕ ФУНКЦИИ
+# ══════════════════════════════════════════════
+def okx_set_leverage() -> bool:
+    r = okx_post("/api/v5/account/set-leverage", {
+        "instId": SYMBOL,
+        "lever": str(LEVERAGE),
+        "mgnMode": "cross",
+    })
+    code = r.get("code", "-1")
+    if code == "0":
+        log.info(f"Плечо x{LEVERAGE} установлено ✅")
+        return True
+    log.warning(f"set_leverage: {r.get('msg')} (код {code})")
+    return True
+
+def okx_get_balance() -> float:
+    r = okx_get("/api/v5/account/balance", {"ccy": "USDT"})
+    try:
+        for detail in r["data"][0]["details"]:
+            if detail["ccy"] == "USDT":
+                return float(detail["availBal"])
     except:
         pass
     return 0.0
 
-# ══════════════════════════════════════════════
-# УПРОЩЁННАЯ ФУНКЦИЯ ОТПРАВКИ ОРДЕРА (БЕЗ TP/SL)
-# ══════════════════════════════════════════════
-def open_simple_order(side: str, qty: float) -> dict:
-    """Открывает простой рыночный ордер без стоп-лосса и тейк-профита"""
-    set_leverage()
-    switch_to_one_way_mode()
+def okx_get_positions() -> list:
+    r = okx_get("/api/v5/account/positions", {"instId": SYMBOL})
+    return [p for p in r.get("data", []) if float(p.get("pos", 0)) != 0]
+
+def okx_place_order(direction: str, entry: float, sl: float, tp: float) -> dict:
+    okx_set_leverage()
+    side = "buy" if direction == "LONG" else "sell"
+    pos_side = "long" if direction == "LONG" else "short"
+    contract_size = 0.01
+    qty = max(1, round(ORDER_USDT * LEVERAGE / entry / contract_size))
     body = {
-        "category": "linear",
-        "symbol": SYMBOL,
+        "instId": SYMBOL,
+        "tdMode": "cross",
         "side": side,
-        "orderType": "Market",
-        "qty": str(qty),
-        "timeInForce": "IOC",
-        "positionIdx": 0,
+        "posSide": pos_side,
+        "ordType": "market",
+        "sz": str(qty),
+        "tpTriggerPx": str(round(tp, 2)),
+        "tpOrdPx": "-1",
+        "slTriggerPx": str(round(sl, 2)),
+        "slOrdPx": "-1",
+        "tpTriggerPxType": "last",
+        "slTriggerPxType": "last",
     }
-    r = bybit_post("/v5/order/create", body)
-    return r
+    r = okx_post("/api/v5/trade/order", body)
+    code = r.get("code", "-1")
+    if code == "0":
+        order_id = r["data"][0].get("ordId", "—")
+        log.info(f"✅ Ордер открыт: {direction} {qty} контр. | ID: {order_id}")
+        return {"ok": True, "orderId": order_id, "qty": qty}
+    else:
+        msg = r.get("msg", "") or (r.get("data", [{}])[0].get("sMsg", ""))
+        log.error(f"❌ Ордер ошибка {code}: {msg}")
+        return {"ok": False, "code": code, "msg": msg}
 
 # ══════════════════════════════════════════════
 # РЫНОЧНЫЕ ДАННЫЕ
 # ══════════════════════════════════════════════
 def get_klines(interval="5m", limit=150):
     try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={SYMBOL}&interval={interval}&limit={limit}"
-        data = requests.get(url, timeout=10).json()
+        data = requests.get(
+            f"https://api.binance.com/api/v3/klines?symbol={SYMBOL_BN}&interval={interval}&limit={limit}",
+            timeout=10
+        ).json()
         df = pd.DataFrame(data, columns=[
             "time", "open", "high", "low", "close", "volume",
             "close_time", "quote_vol", "trades",
@@ -206,14 +192,20 @@ def get_klines(interval="5m", limit=150):
 
 def get_funding_rate() -> float:
     try:
-        d = requests.get(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={SYMBOL}", timeout=8).json()
+        d = requests.get(
+            f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={SYMBOL_BN}",
+            timeout=8
+        ).json()
         return float(d["lastFundingRate"])
     except:
         return 0.0
 
 def get_orderbook_imbalance() -> float:
     try:
-        d = requests.get(f"https://api.binance.com/api/v3/depth?symbol={SYMBOL}&limit=20", timeout=8).json()
+        d = requests.get(
+            f"https://api.binance.com/api/v3/depth?symbol={SYMBOL_BN}&limit=20",
+            timeout=8
+        ).json()
         bids = sum(float(b[1]) for b in d["bids"])
         asks = sum(float(a[1]) for a in d["asks"])
         tot = bids + asks
@@ -221,7 +213,10 @@ def get_orderbook_imbalance() -> float:
     except:
         return 0.0
 
-def calc_indicators(df):
+# ══════════════════════════════════════════════
+# ИНДИКАТОРЫ
+# ══════════════════════════════════════════════
+def calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["EMA9"] = df["close"].ewm(span=9, adjust=False).mean()
     df["EMA21"] = df["close"].ewm(span=21, adjust=False).mean()
     df["EMA50"] = df["close"].ewm(span=50, adjust=False).mean()
@@ -252,6 +247,9 @@ def calc_indicators(df):
 
     return df
 
+# ══════════════════════════════════════════════
+# СИСТЕМА БАЛЛОВ
+# ══════════════════════════════════════════════
 def get_scalp_signal(df, funding, ob, force_test=False):
     row = df.iloc[-1]
     prev = df.iloc[-2]
@@ -308,40 +306,65 @@ def get_scalp_signal(df, funding, ob, force_test=False):
     elif row["buy_ratio"] < 0.45:
         short_s += 1
 
+    # ПРИНУДИТЕЛЬНЫЙ СИГНАЛ ДЛЯ ТЕСТА
     if force_test:
         long_s = 10
 
     if long_s >= MIN_SCORE and long_s > short_s:
-        direction = "LONG"
-        score = long_s
-        entry = price
-        stop = round(entry - atr * 0.5, 2)
-        tp = round(entry + atr * 1.5, 2)
+        direction, score = "LONG", long_s
     elif short_s >= MIN_SCORE and short_s > long_s:
-        direction = "SHORT"
-        score = short_s
-        entry = price
-        stop = round(entry + atr * 0.5, 2)
-        tp = round(entry - atr * 1.5, 2)
+        direction, score = "SHORT", short_s
     else:
         return None, None, None, None, max(long_s, short_s), "Балл ниже порога"
 
-    reason = (f"Балл {score}/{MAX_SCORE} | RSI {rsi:.0f} | "
-              f"OB {ob:+.1f}% | Fund {funding:.5f} | "
-              f"ATR {atr:.2f}")
-    return direction, entry, stop, tp, score, reason
+    max_atr = price * 0.02
+    if atr > max_atr or atr <= 0:
+        log.warning(f"ATR некорректный ({atr:.2f}) — используем 0.5% цены")
+        atr = price * 0.005
 
-def score_bar(score, max_score=MAX_SCORE) -> str:
-    pct = score / max_score
+    entry = price
+    if direction == "LONG":
+        sl = round(entry - atr * 0.5, 2)
+        tp = round(entry + atr * 1.5, 2)
+        if tp <= entry:
+            tp = round(entry * 1.003, 2)
+        if sl >= entry:
+            sl = round(entry * 0.997, 2)
+    else:
+        sl = round(entry + atr * 0.5, 2)
+        tp = round(entry - atr * 1.5, 2)
+        if tp >= entry:
+            tp = round(entry * 0.997, 2)
+        if sl <= entry:
+            sl = round(entry * 1.003, 2)
+
+    log.info(f"Сигнал: {direction} | Вход:{entry:.2f} SL:{sl:.2f} TP:{tp:.2f} ATR:{atr:.2f}")
+
+    reason = (f"Балл {score}/{MAX_SCORE} | RSI {rsi:.0f} | "
+              f"OB {ob:+.1f}% | Fund {funding:.5f} | ATR {atr:.2f}")
+    return direction, entry, sl, tp, score, reason
+
+# ══════════════════════════════════════════════
+# ШКАЛА БАЛЛОВ
+# ══════════════════════════════════════════════
+def score_bar(score) -> str:
+    pct = score / MAX_SCORE
     filled = round(pct * 10)
     bar = "█" * filled + "░" * (10 - filled)
-    emoji = "🟢" if pct >= 0.8 else ("🟡" if pct >= 0.6 else "🔴")
-    return f"{emoji} [{bar}] {score}/{max_score}"
+    if pct >= 0.77:
+        emoji = "🟢"
+    elif pct >= 0.6:
+        emoji = "🟡"
+    else:
+        emoji = "🔴"
+    return f"{emoji} [{bar}] {score}/{MAX_SCORE}"
 
+# ══════════════════════════════════════════════
+# ГЛАВНЫЙ ЦИКЛ
+# ══════════════════════════════════════════════
 last_trade_time = 0
-COOLDOWN = 15 * 60
 
-def run_scan():
+def run_scan(force_test=False):
     global last_trade_time
     df = get_klines("5m", 150)
     if df is None:
@@ -351,13 +374,13 @@ def run_scan():
     calc_indicators(df)
     funding = get_funding_rate()
     ob = get_orderbook_imbalance()
+    price = df.iloc[-1]["close"]
 
-    direction, entry, stop, tp, score, reason = get_scalp_signal(
-        df, funding, ob, force_test=FORCE_TEST
+    direction, entry, sl, tp, score, reason = get_scalp_signal(
+        df, funding, ob, force_test=force_test
     )
 
-    price = df.iloc[-1]["close"]
-    log.info(f"Цена: {price:.2f} | Балл: {score} | Направление: {direction}")
+    log.info(f"Цена: {price:.2f} | Балл: {score} | {direction or 'нет сигнала'}")
 
     if direction is None:
         log.info(f"Нет сигнала — {reason}")
@@ -365,77 +388,75 @@ def run_scan():
 
     e = "🟢" if direction == "LONG" else "🔴"
     arrow = "↗️" if direction == "LONG" else "↘️"
-    msg_lines = [
+    dist_tp = abs(tp - entry)
+    dist_sl = abs(sl - entry)
+    msg = [
         f"{arrow} <b>SCALP {direction}</b> {e}",
         f"",
         f"<b>Надёжность:</b>",
         score_bar(score),
         f"",
-        f"💰 Вход:  <b>{entry:.2f}</b>",
-        f"🛑 Стоп:  {stop:.2f}",
-        f"🎯 Тейк:  {tp:.2f}",
+        f"💰 Вход: <b>{entry:.2f}</b>",
+        f"🛑 Стоп: {sl:.2f} (-{dist_sl:.2f}$)",
+        f"🎯 Тейк: {tp:.2f} (+{dist_tp:.2f}$)",
+        f"📊 R/R: {dist_tp / max(dist_sl, 0.01):.1f}",
+        f"",
         f"📊 {reason}",
         f"",
     ]
 
     now = time.time()
     cooldown = (now - last_trade_time) > COOLDOWN
-    positions = get_open_positions()
+    positions = okx_get_positions()
     has_pos = len(positions) > 0
 
-    if not cooldown:
-        msg_lines.append(f"⏳ Кулдаун — жду {int((COOLDOWN - (now - last_trade_time)) // 60)} мин")
+    if not OKX_API_KEY:
+        msg.append("⚠️ OKX_API_KEY не задан — ордер не отправлен")
+    elif not cooldown:
+        left = int((COOLDOWN - (now - last_trade_time)) // 60)
+        msg.append(f"⏳ Кулдаун — осталось {left} мин")
     elif has_pos:
-        msg_lines.append(f"⚠️ Уже есть открытая позиция — пропускаю")
-    elif not BYBIT_API_KEY:
-        msg_lines.append(f"⚠️ BYBIT_API_KEY не задан — ордер не отправлен")
+        msg.append(f"⚠️ Уже есть открытая позиция — пропускаю")
     else:
-        bybit_side = "Buy" if direction == "LONG" else "Sell"
-        # Отправляем простой ордер без стоп-лосса и тейк-профита
-        result = open_simple_order(bybit_side, QTY)
-        code = result.get("retCode", -1)
-
-        if code == 0:
-            order_id = result.get("result", {}).get("orderId", "—")
+        result = okx_place_order(direction, entry, sl, tp)
+        if result["ok"]:
             last_trade_time = now
-            msg_lines += [
-                f"✅ <b>ИСПОЛНЕНО НА BYBIT</b>",
-                f"   OrderID: {order_id}",
-                f"   Кол-во: {QTY} ETH",
+            msg += [
+                f"✅ <b>ИСПОЛНЕНО НА OKX DEMO</b>",
+                f"📦 Контрактов: {result['qty']}",
+                f"🆔 OrderID: {result['orderId']}",
             ]
-            log.info(f"✅ Ордер открыт: {direction} {QTY} ETH | ID: {order_id}")
         else:
-            err = result.get("retMsg", "неизвестно")
-            msg_lines += [
-                f"❌ Ошибка Bybit (код {code}):",
-                f"   {err}",
+            msg += [
+                f"❌ Ошибка OKX (код {result['code']}):",
+                f"📝 {result['msg']}",
             ]
-            log.error(f"Bybit ошибка {code}: {err}")
 
-    msg_lines.append(f"\n⏰ {datetime.utcnow().strftime('%d.%m.%Y %H:%M:%S')} UTC")
-    send_telegram("\n".join(msg_lines))
+    msg.append(f"\n⏰ {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M:%S')} UTC")
+    send_telegram("\n".join(msg))
 
 def bot_loop():
-    log.info(f"🚀 Бот запущен | {SYMBOL} | скан каждые {SCAN_INTERVAL // 60} мин")
-    balance = get_balance()
+    log.info(f"🚀 OKX Scalp Bot запущен | {SYMBOL}")
+    balance = okx_get_balance()
     send_telegram(
-        f"🚀 <b>Scalp Bot запущен</b>\n\n"
-        f"Биржа:   Bybit {'TESTNET' if 'testnet' in BYBIT_BASE_URL else 'MAINNET'}\n"
-        f"Символ:  {SYMBOL}\n"
-        f"Плечо:   x{LEVERAGE}\n"
-        f"Объём:   {QTY} ETH/сделка\n"
-        f"Баланс:  {balance:.2f} USDT\n"
-        f"Мин балл:{MIN_SCORE}/{MAX_SCORE}\n"
-        f"Скан:    каждые {SCAN_INTERVAL // 60} мин\n\n"
-        f"⚠️ Бот торгует автоматически!"
+        f"🚀 <b>OKX Scalp Bot запущен</b>\n\n"
+        f"🎭 Режим: DEMO (simulated)\n"
+        f"📊 Символ: {SYMBOL}\n"
+        f"⚙️ Плечо: x{LEVERAGE}\n"
+        f"💰 Сделка: {ORDER_USDT}$ USDT\n"
+        f"💳 Баланс: {balance:.2f} USDT\n"
+        f"🎯 Мин балл: {MIN_SCORE}/{MAX_SCORE}\n"
+        f"⏱️ Скан: каждые {SCAN_INTERVAL // 60} мин\n\n"
+        f"⚠️ Бот торгует автоматически на демо-счёте"
     )
 
     while True:
         try:
-            run_scan()
+            # ПРИНУДИТЕЛЬНЫЙ ТЕСТ (force_test = True)
+            run_scan(force_test=True)
         except Exception as e:
-            log.error(f"Ошибка цикла: {e}")
-            send_telegram(f"⚠️ Ошибка: {e}")
+            log.error(f"Ошибка: {e}")
+            send_telegram(f"❌ Ошибка бота: {e}")
         time.sleep(SCAN_INTERVAL)
 
 if __name__ == "__main__":
