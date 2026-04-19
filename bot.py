@@ -28,6 +28,9 @@ QTY              = 0.01
 MIN_SCORE        = 7
 MAX_SCORE        = 13
 
+# ⚠️ ДЛЯ ТЕСТА BYBIT — ПРИНУДИТЕЛЬНЫЙ СИГНАЛ (force_test = True)
+FORCE_TEST       = True   # ← После проверки смени на False
+
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
@@ -357,7 +360,7 @@ def score_bar(score, max_score=MAX_SCORE) -> str:
 last_trade_time = 0
 COOLDOWN = 15 * 60
 
-def run_scan(force_test=False):
+def run_scan():
     global last_trade_time
     df = get_klines("5m", 150)
     if df is None:
@@ -369,7 +372,7 @@ def run_scan(force_test=False):
     ob = get_orderbook_imbalance()
 
     direction, entry, stop, tp, score, reason = get_scalp_signal(
-        df, funding, ob, force_test=force_test
+        df, funding, ob, force_test=FORCE_TEST
     )
 
     price = df.iloc[-1]["close"]
