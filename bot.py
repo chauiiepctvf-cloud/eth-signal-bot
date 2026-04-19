@@ -1,4 +1,4 @@
-Рома Брат, [19 апр. 2026 в 16:06]
+
 import os
 import time
 import logging
