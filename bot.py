@@ -21,7 +21,7 @@ OKX_API_KEY = os.environ.get("OKX_API_KEY")
 OKX_SECRET = os.environ.get("OKX_SECRET")
 OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE")
 OKX_BASE = "https://www.okx.com"
-OKX_DEMO_HEADER = {"x-simulated-trading": "1"}  # ← убери для реала
+OKX_DEMO_HEADER = {"x-simulated-trading": "1"}  # убери для реала
 SYMBOL = "ETH-USDT-SWAP"
 SYMBOL_BN = "ETHUSDT"
 LEVERAGE = 20
@@ -30,6 +30,7 @@ MIN_SCORE = 7
 MAX_SCORE = 13
 SCAN_INTERVAL = 5 * 60
 COOLDOWN = 15 * 60
+HEARTBEAT_INTERVAL = 60 * 60  # 60 минут = 1 час
 
 # ══ ТЕСТОВЫЙ РЕЖИМ ══════════════════════════
 # True = принудительный LONG сигнал для проверки исполнения
@@ -431,9 +432,19 @@ def score_bar(score) -> str:
 # ГЛАВНЫЙ ЦИКЛ
 # ══════════════════════════════════════════════
 last_trade_time = 0
+last_heartbeat_time = 0
 
 def run_scan():
-    global last_trade_time
+    global last_trade_time, last_heartbeat_time
+    current_time = time.time()
+
+    # ── Heartbeat: раз в час ─────────────────
+    if current_time - last_heartbeat_time >= HEARTBEAT_INTERVAL:
+        last_heartbeat_time = current_time
+        mode = "🧪 ТЕСТ" if FORCE_TEST else "⚔️ БОЕВОЙ"
+        # Для heartbeat нам нужна актуальная цена, получим её позже
+        # Пока просто заглушка, цена будет добавлена после получения данных
+
     df = get_klines("5m", 150)
     if df is None:
         send_telegram("❌ Ошибка свечей")
@@ -443,6 +454,20 @@ def run_scan():
     funding = get_funding()
     ob = get_ob()
     price = df.iloc[-1]["close"]
+
+    # Отправляем heartbeat, если пришло его время
+    if current_time - last_heartbeat_time < HEARTBEAT_INTERVAL and last_heartbeat_time > 0:
+        # Отправляем heartbeat только если он был инициирован в этом скане
+        if current_time - last_heartbeat_time + SCAN_INTERVAL >= HEARTBEAT_INTERVAL:
+            mode = "🧪 ТЕСТ" if FORCE_TEST else "⚔️ БОЕВОЙ"
+            heartbeat_msg = (
+                f"❤️ <b>Heartbeat</b>\n"
+                f"Режим: {mode}\n"
+                f"Последняя цена: {price:.2f}\n"
+                f"Состояние: Работаем, сигналов нет\n"
+                f"⏰ {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M:%S')} UTC"
+            )
+            send_telegram(heartbeat_msg)
 
     direction, entry, sl, tp, score, reason = get_signal(df, funding, ob)
 
