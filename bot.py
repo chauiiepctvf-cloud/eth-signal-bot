@@ -28,11 +28,10 @@ BTC_SYMBOL = "BTCUSDT"
 LEVERAGE = 20
 ORDER_USDT = 20
 SCAN_INTERVAL = 3 * 60          # скан каждые 3 минуты
-COOLDOWN = 10 * 60              # 10 мин между сделками
 HEARTBEAT_INTERVAL = 60 * 60    # раз в час
 
 # ── ПАРАМЕТРЫ СИГНАЛА ──────────────────────
-MIN_SCORE = 5        # низкий порог = больше сигналов
+MIN_SCORE = 6        # повышенный порог
 MAX_SCORE = 11       # максимум очков
 
 # ── TP / SL (множители ATR) ────────────────
@@ -41,7 +40,7 @@ TP_MULT = 2.0        # тейк = 2 ATR (R/R = 2:1)
 
 # ── ATR ФИЛЬТР ─────────────────────────────
 ATR_MIN_PCT = 0.001  # 0.1% — убираем только мёртвый рынок
-ATR_MAX_PCT = 0.05   # 5% — защита от кривых данных
+ATR_MAX_PCT = 0.05   # 5% — защита от кривых 데이터
 
 # ── ЗАЩИТЫ ─────────────────────────────────
 MAX_LOSSES = 4
@@ -60,12 +59,62 @@ def home():
     mode = "🧪 ТЕСТ" if FORCE_TEST else "⚔️ БОЕВОЙ"
     return f"OKX Scalp Bot [{mode}] | {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC"
 
-# Состояние
-last_trade_time = 0
+# ══════════════════════════════════════════════
+# СОСТОЯНИЕ БОТА
+# ══════════════════════════════════════════════
 last_heartbeat_time = 0
 losses_in_row = 0
 pause_until = 0
 ob_history = []
+
+# Статистика сделок
+stats = {
+    "total": 0,
+    "wins": 0,
+    "losses": 0,
+    "total_profit": 0.0
+}
+
+# Файл для сохранения статистики
+STATS_FILE = "bot_stats.json"
+
+def load_stats():
+    global stats
+    try:
+        with open(STATS_FILE, "r") as f:
+            stats = json.load(f)
+        log.info(f"📊 Статистика загружена: {stats}")
+    except:
+        log.info("📊 Нет сохранённой статистики, начинаем с нуля")
+
+def save_stats():
+    try:
+        with open(STATS_FILE, "w") as f:
+            json.dump(stats, f)
+    except Exception as e:
+        log.error(f"Ошибка сохранения статистики: {e}")
+
+# Активные позиции для отслеживания
+active_positions = {}
+
+def load_active_positions():
+    global active_positions
+    try:
+        with open("active_positions.json", "r") as f:
+            active_positions = json.load(f)
+        log.info(f"📋 Загружено {len(active_positions)} активных позиций")
+    except:
+        log.info("📋 Нет сохранённых позиций")
+
+def save_active_positions():
+    try:
+        with open("active_positions.json", "w") as f:
+            json.dump(active_positions, f)
+    except Exception as e:
+        log.error(f"Ошибка сохранения позиций: {e}")
+
+load_stats()
+load_active_positions()
 
 # ══════════════════════════════════════════════
 # TELEGRAM
@@ -169,6 +218,18 @@ def okx_place_order(direction, entry, sl, tp):
         return {"ok": False, "step": "open", "msg": msg}
     order_id = r["data"][0].get("ordId", "—")
     log.info(f"✅ Открыта ordId:{order_id}")
+    
+    # Сохраняем информацию о позиции для отслеживания
+    active_positions[order_id] = {
+        "direction": direction,
+        "entry": entry,
+        "sl": sl,
+        "tp": tp,
+        "qty": qty,
+        "open_time": time.time()
+    }
+    save_active_positions()
+    
     time.sleep(2)
 
     # Шаг 2: OCO (TP + SL одним запросом)
@@ -238,7 +299,6 @@ def get_ob():
         return 0.0
 
 def get_btc_momentum():
-    """Изменение BTC за последние 3 свечи 3m."""
     try:
         df = get_klines(BTC_SYMBOL, "3m", 5)
         if df is None:
@@ -247,6 +307,63 @@ def get_btc_momentum():
         return round(chg, 3)
     except:
         return 0.0
+
+# ══════════════════════════════════════════════
+# ПРОВЕРКА ЗАКРЫТЫХ ПОЗИЦИЙ
+# ══════════════════════════════════════════════
+def check_closed_positions():
+    global stats, active_positions
+    try:
+        current_positions = okx_get_positions()
+        current_order_ids = [p.get("ordId", "") for p in current_positions if p.get("ordId")]
+        
+        closed_orders = []
+        for order_id, pos_info in list(active_positions.items()):
+            if order_id not in current_order_ids:
+                closed_orders.append((order_id, pos_info))
+        
+        for order_id, pos_info in closed_orders:
+            direction = pos_info["direction"]
+            entry = pos_info["entry"]
+            tp = pos_info["tp"]
+            sl = pos_info["sl"]
+            
+            # Пытаемся определить результат по истории ордеров
+            try:
+                history = okx_get("/api/v5/trade/orders-history", {"instId": SYMBOL, "ordId": order_id})
+                if history.get("code") == "0" and history.get("data"):
+                    order_data = history["data"][0]
+                    fill_price = float(order_data.get("avgPx", entry))
+                    if fill_price >= tp:
+                        result = "TP"
+                        profit_pct = (tp - entry) / entry * 100
+                        profit_usdt = profit_pct / 100 * ORDER_USDT
+                        stats["wins"] += 1
+                        stats["total_profit"] += profit_usdt
+                        msg = f"✅ СДЕЛКА ЗАКРЫТА\nНаправление: {direction}\nПричина: ТЕЙК-ПРОФИТ\nПрибыль: +{profit_usdt:.2f} USDT (+{profit_pct:.2f}%)"
+                    elif fill_price <= sl:
+                        result = "SL"
+                        loss_pct = (entry - sl) / entry * 100
+                        loss_usdt = loss_pct / 100 * ORDER_USDT
+                        stats["losses"] += 1
+                        stats["total_profit"] -= loss_usdt
+                        msg = f"❌ СДЕЛКА ЗАКРЫТА\nНаправление: {direction}\nПричина: СТОП-ЛОСС\nУбыток: -{loss_usdt:.2f} USDT (-{loss_pct:.2f}%)"
+                    else:
+                        continue
+                else:
+                    continue
+            except:
+                continue
+            
+            stats["total"] += 1
+            winrate = (stats["wins"] / stats["total"] * 100) if stats["total"] > 0 else 0
+            msg += f"\n\n📊 СТАТИСТИКА:\nВсего сделок: {stats['total']}\n✅ Прибыльных: {stats['wins']} ({winrate:.1f}%)\n❌ Убыточных: {stats['losses']}\n💰 Общий P&L: {stats['total_profit']:.2f} USDT"
+            send_telegram(msg)
+            save_stats()
+            del active_positions[order_id]
+            save_active_positions()
+    except Exception as e:
+        log.error(f"Ошибка проверки позиций: {e}")
 
 # ══════════════════════════════════════════════
 # ИНДИКАТОРЫ
@@ -310,7 +427,7 @@ def calc(df):
     return df
 
 # ══════════════════════════════════════════════
-# СИГНАЛ — НОВАЯ ЛОГИКА
+# СИГНАЛ
 # ══════════════════════════════════════════════
 def get_signal(df, funding, ob, btc_mom):
     global ob_history
@@ -427,23 +544,24 @@ def get_signal(df, funding, ob, btc_mom):
 
     # ── Сессия — только ночью штраф ────────────
     hour = datetime.now(timezone.utc).hour
-    if 1 <= hour < 6:  # 01-06 UTC — ночь
+    if 1 <= hour < 6:
         if L >= S:
             L = max(0, L - 1)
         else:
             S = max(0, S - 1)
 
     # Выбор направления
-    if L >= MIN_SCORE and L > S:
-        direction, score = "LONG", L
-    elif S >= MIN_SCORE and S > L:
-        direction, score = "SHORT", S
-    else:
+    long_signal = L >= MIN_SCORE and L > S
+    short_signal = S >= MIN_SCORE and S > L
+
+    if not long_signal and not short_signal:
         return None, None, None, None, max(L, S), f"Балл {max(L,S)}/{MAX_SCORE} (L:{L} S:{S} порог:{MIN_SCORE})"
 
     # Уровни входа
     entry = price
-    if direction == "LONG":
+    if long_signal:
+        direction = "LONG"
+        score = L
         sl = round(entry - atr * SL_MULT, 2)
         tp = round(entry + atr * TP_MULT, 2)
         if sl >= entry:
@@ -451,6 +569,8 @@ def get_signal(df, funding, ob, btc_mom):
         if tp <= entry:
             tp = round(entry * 1.01, 2)
     else:
+        direction = "SHORT"
+        score = S
         sl = round(entry + atr * SL_MULT, 2)
         tp = round(entry - atr * TP_MULT, 2)
         if sl <= entry:
@@ -484,12 +604,15 @@ def score_bar(score):
 # ГЛАВНЫЙ ЦИКЛ
 # ══════════════════════════════════════════════
 def run_scan():
-    global last_trade_time, last_heartbeat_time, losses_in_row, pause_until
+    global last_heartbeat_time, losses_in_row, pause_until
     now = time.time()
 
     if now < pause_until:
         log.info(f"⏸️ Пауза — осталось {int((pause_until - now) / 60)} мин")
         return
+
+    # Проверяем закрытые позиции
+    check_closed_positions()
 
     df = get_klines(SYMBOL_BN, "5m", 150)
     if df is None:
@@ -515,6 +638,7 @@ def run_scan():
             session = "🇬🇧 Лондон"
         else:
             session = "🇺🇸 Нью-Йорк"
+        winrate = (stats["wins"] / stats["total"] * 100) if stats["total"] > 0 else 0
         send_telegram(
             f"❤️ <b>Heartbeat</b>\n\n"
             f"💰 ETH: <b>{price:.2f}</b> ATR: {atr_val:.2f}\n"
@@ -522,7 +646,7 @@ def run_scan():
             f"🌍 Сессия: {session}\n"
             f"💳 Баланс: {bal:.2f} USDT\n"
             f"📊 Позиций: {len(pos)}\n"
-            f"📉 Потерь подряд: {losses_in_row}/{MAX_LOSSES}\n"
+            f"📊 Статистика: {stats['total']} сделок | ✅ {stats['wins']} ({winrate:.1f}%) | ❌ {stats['losses']} | P&L: {stats['total_profit']:.2f} USDT\n"
             f"⏰ {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC"
         )
 
@@ -555,20 +679,15 @@ def run_scan():
         f"",
     ]
 
-    cooldown_ok = (now - last_trade_time) > COOLDOWN
     has_pos = len(okx_get_positions()) > 0
 
     if not OKX_API_KEY:
         msg.append("⚠️ OKX_API_KEY не задан")
-    elif not cooldown_ok:
-        left = int((COOLDOWN - (now - last_trade_time)) // 60)
-        msg.append(f"⏳ Кулдаун — {left} мин")
     elif has_pos:
         msg.append("⚠️ Позиция уже открыта")
     else:
         res = okx_place_order(direction, entry, sl, tp)
         if res["ok"]:
-            last_trade_time = now
             losses_in_row = 0
             algo_s = "✅" if res["algo_ok"] else "⚠️ частично"
             msg += [
@@ -590,6 +709,7 @@ def run_scan():
 def bot_loop():
     log.info("🚀 Старт")
     bal = okx_get_balance()
+    winrate = (stats["wins"] / stats["total"] * 100) if stats["total"] > 0 else 0
     send_telegram(
         f"🚀 <b>OKX Scalp Bot</b>\n\n"
         f"🎭 Режим: {'🧪 ТЕСТ' if FORCE_TEST else '⚔️ БОЕВОЙ'}\n"
@@ -600,7 +720,7 @@ def bot_loop():
         f"🎯 Мин балл: {MIN_SCORE}/{MAX_SCORE}\n"
         f"📐 TP/SL: {TP_MULT}/{SL_MULT} × ATR (R/R={TP_MULT/SL_MULT:.0f}:1)\n"
         f"⏱️ Скан: каждые {SCAN_INTERVAL // 60} мин\n"
-        f"⏳ Кулдаун: {COOLDOWN // 60} мин"
+        f"📊 Статистика: {stats['total']} сделок | ✅ {stats['wins']} ({winrate:.1f}%) | ❌ {stats['losses']} | P&L: {stats['total_profit']:.2f} USDT"
     )
 
     while True:
