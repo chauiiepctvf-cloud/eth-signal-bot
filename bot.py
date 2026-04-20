@@ -384,17 +384,17 @@ def get_signal(df, funding, ob, session_mod=0, btc_trend="NEUTRAL"):
         if atr > price * ATR_MAX_PCT or atr <= 0:
             atr = price * 0.005
         entry = price
-        sl = round(entry - atr * 0.5, 2)
-        tp = round(entry + atr * 1.5, 2)
+        sl = round(entry - atr * 1.2, 2)
+        tp = round(entry + atr * 2.5, 2)
         return direction, entry, sl, tp, score, f"🧪 ТЕСТ | ATR:{atr:.2f} | Цена:{price:.2f}"
 
-    # Фильтр флэта
-    if row["BB_width"] < 0.008:
-        return None, None, None, None, 0, "Флэт (BB_width мал)"
+    # Фильтр флэта (ужесточённый)
+    if row["BB_width"] < 0.008 and atr < price * 0.003:
+        return None, None, None, None, 0, "Флэт (BB_width мал, ATR низкий)"
 
-    # Фильтр ATR снизу — рынок спит
-    if atr < price * ATR_MIN_PCT:
-        return None, None, None, None, 0, f"ATR слишком мал ({atr:.2f}) — рынок спит"
+    # Минимальная волатильность для входа
+    if atr < price * 0.003:
+        return None, None, None, None, 0, f"ATR слишком мал ({atr:.2f}) — нет движения"
 
     # Динамика стакана
     ob_history.append(ob)
@@ -479,19 +479,19 @@ def get_signal(df, funding, ob, session_mod=0, btc_trend="NEUTRAL"):
 
     entry = price
     if direction == "LONG":
-        sl = round(entry - atr * 0.5, 2)
-        tp = round(entry + atr * 1.5, 2)
+        sl = round(entry - atr * 1.2, 2)
+        tp = round(entry + atr * 2.5, 2)
         if tp <= entry:
-            tp = round(entry * 1.003, 2)
+            tp = round(entry * 1.008, 2)
         if sl >= entry:
-            sl = round(entry * 0.997, 2)
+            sl = round(entry * 0.992, 2)
     else:
-        sl = round(entry + atr * 0.5, 2)
-        tp = round(entry - atr * 1.5, 2)
+        sl = round(entry + atr * 1.2, 2)
+        tp = round(entry - atr * 2.5, 2)
         if tp >= entry:
-            tp = round(entry * 0.997, 2)
+            tp = round(entry * 0.992, 2)
         if sl <= entry:
-            sl = round(entry * 1.003, 2)
+            sl = round(entry * 1.008, 2)
 
     log.info(f"{direction} | вход:{entry:.2f} sl:{sl:.2f} tp:{tp:.2f} atr:{atr:.2f}")
 
