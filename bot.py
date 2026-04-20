@@ -482,8 +482,12 @@ def calc(df):
 # ══════════════════════════════════════════════
 def get_signal(df, funding, ob, btc_mom):
     global ob_history
+    
+    # Проверка на достаточность данных
+    if df is None or len(df) < 3:
+        return None, None, None, None, 0, "Недостаточно данных"
+    
     row = df.iloc[-1]
-    prev = df.iloc[-2]
     price = row["close"]
     rsi = row["RSI"]
     atr = row["ATR"]
