@@ -30,11 +30,27 @@ MIN_SCORE = 7
 MAX_SCORE = 13
 SCAN_INTERVAL = 5 * 60
 COOLDOWN = 15 * 60
-HEARTBEAT_INTERVAL = 60 * 60  # 60 минут = 1 час
+HEARTBEAT_INTERVAL = 60 * 60  # раз в час
+
+# Фильтр сессий (UTC)
+SESSION_ASIAN_START = 0      # 00:00 UTC — азиатская сессия (вялая)
+SESSION_ASIAN_END = 7        # 07:00 UTC
+SESSION_LONDON_START = 7     # 07:00 UTC — лондонская (активная)
+SESSION_NY_START = 13        # 13:00 UTC — американская (самая активная)
+SESSION_NY_END = 21          # 21:00 UTC
+
+# ATR фильтры
+ATR_MIN_PCT = 0.002          # минимум 0.2% от цены — иначе рынок спит
+ATR_MAX_PCT = 0.02           # максимум 2% — иначе данные кривые
+
+# Счётчик потерь подряд — защита от плохого рынка
+MAX_LOSSES_IN_ROW = 3
+PAUSE_AFTER_LOSSES = 120 * 60  # пауза 2 часа
+
+# Корреляция BTC — не входим в лонг ETH если BTC падает
+BTC_SYMBOL = "BTCUSDT"
 
 # ══ ТЕСТОВЫЙ РЕЖИМ ══════════════════════════
-# True = принудительный LONG сигнал для проверки исполнения
-# False = реальные сигналы по баллам
 FORCE_TEST = False
 # ════════════════════════════════════════════
 
@@ -45,8 +61,17 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    mode = "ТЕСТ" if FORCE_TEST else "БОЕВОЙ"
+    mode = "🧪 ТЕСТ" if FORCE_TEST else "⚔️ БОЕВОЙ"
     return f"OKX Scalp Bot [{mode}] | {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC"
+
+# ══════════════════════════════════════════════
+# СОСТОЯНИЕ БОТА
+# ══════════════════════════════════════════════
+last_trade_time = 0
+last_heartbeat_time = 0
+losses_in_row = 0
+pause_until = 0
+ob_history = []  # история стакана для динамики
 
 # ══════════════════════════════════════════════
 # TELEGRAM
@@ -135,20 +160,15 @@ def okx_get_positions() -> list:
     return [p for p in r.get("data", []) if float(p.get("pos", 0)) != 0]
 
 def okx_place_order(direction: str, entry: float, sl: float, tp: float) -> dict:
-    """
-    Шаг 1: открываем рыночный ордер
-    Шаг 2: TP+SL одним OCO algo ордером (OKX рекомендованный способ)
-    """
     okx_set_leverage()
     side = "buy" if direction == "LONG" else "sell"
     pos_side = "long" if direction == "LONG" else "short"
     cls_side = "sell" if direction == "LONG" else "buy"
 
-    # 1 контракт ETH-USDT-SWAP = 0.01 ETH
     qty = max(1, round(ORDER_USDT * LEVERAGE / entry / 0.01))
     log.info(f"Открываем: {direction} | qty:{qty} | entry:{entry:.2f} sl:{sl:.2f} tp:{tp:.2f}")
 
-    # ── Шаг 1: рыночный ордер ─────────────────
+    # Шаг 1: рыночный ордер
     open_r = okx_post("/api/v5/trade/order", {
         "instId": SYMBOL,
         "tdMode": "cross",
@@ -166,10 +186,9 @@ def okx_place_order(direction: str, entry: float, sl: float, tp: float) -> dict:
     order_id = open_r["data"][0].get("ordId", "—")
     log.info(f"✅ Позиция открыта ordId:{order_id}")
 
-    # Ждём пока позиция точно откроется
     time.sleep(2)
 
-    # ── Шаг 2: OCO = TP + SL одним запросом ──
+    # Шаг 2: OCO (TP + SL одним запросом)
     algo_r = okx_post("/api/v5/trade/order-algo", {
         "instId": SYMBOL,
         "tdMode": "cross",
@@ -184,8 +203,7 @@ def okx_place_order(direction: str, entry: float, sl: float, tp: float) -> dict:
         "slOrdPx": "-1",
         "slTriggerPxType": "last",
     })
-    algo_code = algo_r.get("code")
-    algo_ok = algo_code == "0"
+    algo_ok = algo_r.get("code") == "0"
 
     if algo_ok:
         algo_id = algo_r["data"][0].get("algoId", "—")
@@ -196,7 +214,7 @@ def okx_place_order(direction: str, entry: float, sl: float, tp: float) -> dict:
             errmsg = algo_r["data"][0].get("sMsg", errmsg)
         log.error(f"OCO ошибка: {errmsg} — пробую раздельно...")
 
-        # SL отдельно
+        # Фолбэк: SL отдельно
         sl_r = okx_post("/api/v5/trade/order-algo", {
             "instId": SYMBOL,
             "tdMode": "cross",
@@ -211,7 +229,7 @@ def okx_place_order(direction: str, entry: float, sl: float, tp: float) -> dict:
         sl_ok = sl_r.get("code") == "0"
         log.info(f"SL раздельно: {'✅' if sl_ok else '❌'} {sl_r.get('msg', '')}")
 
-        # TP отдельно
+        # Фолбэк: TP отдельно
         tp_r = okx_post("/api/v5/trade/order-algo", {
             "instId": SYMBOL,
             "tdMode": "cross",
@@ -238,10 +256,10 @@ def okx_place_order(direction: str, entry: float, sl: float, tp: float) -> dict:
 # ══════════════════════════════════════════════
 # ДАННЫЕ
 # ══════════════════════════════════════════════
-def get_klines(interval="5m", limit=150):
+def get_klines(symbol=SYMBOL_BN, interval="5m", limit=150):
     try:
         data = requests.get(
-            f"https://api.binance.com/api/v3/klines?symbol={SYMBOL_BN}&interval={interval}&limit={limit}",
+            f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}",
             timeout=10
         ).json()
         df = pd.DataFrame(data, columns=[
@@ -253,7 +271,7 @@ def get_klines(interval="5m", limit=150):
             df[c] = df[c].astype(float)
         return df
     except Exception as e:
-        log.error(f"klines: {e}")
+        log.error(f"klines {symbol} {interval}: {e}")
         return None
 
 def get_funding() -> float:
@@ -277,6 +295,42 @@ def get_ob() -> float:
         return round((bids - asks) / tot * 100, 1) if tot else 0.0
     except:
         return 0.0
+
+def get_btc_trend() -> str:
+    """Тренд BTC за последние 3 свечи 5m — для корреляции."""
+    try:
+        df = get_klines(BTC_SYMBOL, "5m", 5)
+        if df is None:
+            return "NEUTRAL"
+        last = df.iloc[-1]["close"]
+        prev3 = df.iloc[-3]["close"]
+        chg = (last - prev3) / prev3 * 100
+        if chg > 0.15:
+            return "UP"
+        if chg < -0.15:
+            return "DOWN"
+        return "NEUTRAL"
+    except:
+        return "NEUTRAL"
+
+# ══════════════════════════════════════════════
+# ФИЛЬТР СЕССИЙ
+# ══════════════════════════════════════════════
+def get_session_info() -> dict:
+    """
+    Возвращает текущую сессию и модификатор MIN_SCORE.
+    Азиатская — поднимаем порог (меньше сигналов).
+    Американская — опускаем порог (больше сигналов).
+    """
+    hour = datetime.now(timezone.utc).hour
+    if SESSION_ASIAN_START <= hour < SESSION_ASIAN_END:
+        return {"name": "🇯🇵 Азиатская", "score_mod": +2}   # требуем балл выше
+    elif SESSION_NY_START <= hour < SESSION_NY_END:
+        return {"name": "🇺🇸 Американская", "score_mod": -1} # чуть мягче
+    elif SESSION_LONDON_START <= hour < SESSION_NY_START:
+        return {"name": "🇬🇧 Лондонская", "score_mod": 0}
+    else:
+        return {"name": "🌙 Закрытие", "score_mod": +1}
 
 # ══════════════════════════════════════════════
 # ИНДИКАТОРЫ
@@ -315,27 +369,40 @@ def calc(df: pd.DataFrame) -> pd.DataFrame:
 # ══════════════════════════════════════════════
 # СИГНАЛ
 # ══════════════════════════════════════════════
-def get_signal(df, funding, ob):
+def get_signal(df, funding, ob, session_mod=0, btc_trend="NEUTRAL"):
+    global ob_history
     row = df.iloc[-1]
     prev = df.iloc[-2]
     price = row["close"]
     rsi = row["RSI"]
     atr = row["ATR"]
 
-    # Тестовый режим — принудительный LONG
+    # Тестовый режим
     if FORCE_TEST:
         direction = "LONG"
         score = 10
-        if atr > price * 0.02 or atr <= 0:
+        if atr > price * ATR_MAX_PCT or atr <= 0:
             atr = price * 0.005
         entry = price
         sl = round(entry - atr * 0.5, 2)
         tp = round(entry + atr * 1.5, 2)
         return direction, entry, sl, tp, score, f"🧪 ТЕСТ | ATR:{atr:.2f} | Цена:{price:.2f}"
 
-    # Реальный режим
+    # Фильтр флэта
     if row["BB_width"] < 0.008:
-        return None, None, None, None, 0, "Флэт"
+        return None, None, None, None, 0, "Флэт (BB_width мал)"
+
+    # Фильтр ATR снизу — рынок спит
+    if atr < price * ATR_MIN_PCT:
+        return None, None, None, None, 0, f"ATR слишком мал ({atr:.2f}) — рынок спит"
+
+    # Динамика стакана
+    ob_history.append(ob)
+    if len(ob_history) > 5:
+        ob_history.pop(0)
+    ob_trend = "RISING" if len(ob_history) >= 3 and ob_history[-1] > ob_history[-3] else \
+               "FALLING" if len(ob_history) >= 3 and ob_history[-1] < ob_history[-3] else \
+               "FLAT"
 
     L = S = 0
 
@@ -373,6 +440,12 @@ def get_signal(df, funding, ob):
     elif ob < -8:
         S += 2
 
+    # Динамика стакана — усиливаем или ослабляем
+    if ob_trend == "RISING":
+        L += 1
+    if ob_trend == "FALLING":
+        S += 1
+
     if row["momentum"] > 0 and prev["momentum"] > 0:
         L += 1
     elif row["momentum"] < 0 and prev["momentum"] < 0:
@@ -383,14 +456,25 @@ def get_signal(df, funding, ob):
     elif row["buy_ratio"] < 0.45:
         S += 1
 
-    if L >= MIN_SCORE and L > S:
+    # Корреляция BTC
+    if btc_trend == "DOWN":
+        L -= 2   # BTC падает — не входим в лонг ETH
+    elif btc_trend == "UP":
+        S -= 2   # BTC растёт — не входим в шорт ETH
+
+    # Применяем модификатор сессии
+    effective_min = MIN_SCORE + session_mod
+
+    if L >= effective_min and L > S:
         direction, score = "LONG", L
-    elif S >= MIN_SCORE and S > L:
+    elif S >= effective_min and S > L:
         direction, score = "SHORT", S
     else:
-        return None, None, None, None, max(L, S), "Балл ниже порога"
+        return None, None, None, None, max(L, S), \
+               f"Балл ниже порога (L:{L} S:{S} порог:{effective_min})"
 
-    if atr > price * 0.02 or atr <= 0:
+    # Защита ATR
+    if atr > price * ATR_MAX_PCT or atr <= 0:
         atr = price * 0.005
 
     entry = price
@@ -411,7 +495,9 @@ def get_signal(df, funding, ob):
 
     log.info(f"{direction} | вход:{entry:.2f} sl:{sl:.2f} tp:{tp:.2f} atr:{atr:.2f}")
 
-    reason = f"Балл {score}/{MAX_SCORE} | RSI {rsi:.0f} | OB {ob:+.1f}% | Fund {funding:.5f} | ATR {atr:.2f}"
+    reason = (f"Балл {score}/{MAX_SCORE} | RSI {rsi:.0f} | "
+              f"OB {ob:+.1f}%({ob_trend}) | Fund {funding:.5f} | "
+              f"ATR {atr:.2f} | BTC:{btc_trend}")
     return direction, entry, sl, tp, score, reason
 
 # ══════════════════════════════════════════════
@@ -431,21 +517,17 @@ def score_bar(score) -> str:
 # ══════════════════════════════════════════════
 # ГЛАВНЫЙ ЦИКЛ
 # ══════════════════════════════════════════════
-last_trade_time = 0
-last_heartbeat_time = 0
-
 def run_scan():
-    global last_trade_time, last_heartbeat_time
+    global last_trade_time, last_heartbeat_time, losses_in_row, pause_until
     current_time = time.time()
 
-    # ── Heartbeat: раз в час ─────────────────
-    if current_time - last_heartbeat_time >= HEARTBEAT_INTERVAL:
-        last_heartbeat_time = current_time
-        mode = "🧪 ТЕСТ" if FORCE_TEST else "⚔️ БОЕВОЙ"
-        # Для heartbeat нам нужна актуальная цена, получим её позже
-        # Пока просто заглушка, цена будет добавлена после получения данных
+    # Пауза после серии потерь
+    if current_time < pause_until:
+        remaining = int((pause_until - current_time) / 60)
+        log.info(f"⏸️ Пауза после {MAX_LOSSES_IN_ROW} потерь — осталось {remaining} мин")
+        return
 
-    df = get_klines("5m", 150)
+    df = get_klines(SYMBOL_BN, "5m", 150)
     if df is None:
         send_telegram("❌ Ошибка свечей")
         return
@@ -453,23 +535,31 @@ def run_scan():
     calc(df)
     funding = get_funding()
     ob = get_ob()
+    btc_trend = get_btc_trend()
+    session = get_session_info()
     price = df.iloc[-1]["close"]
 
-    # Отправляем heartbeat, если пришло его время
-    if current_time - last_heartbeat_time < HEARTBEAT_INTERVAL and last_heartbeat_time > 0:
-        # Отправляем heartbeat только если он был инициирован в этом скане
-        if current_time - last_heartbeat_time + SCAN_INTERVAL >= HEARTBEAT_INTERVAL:
-            mode = "🧪 ТЕСТ" if FORCE_TEST else "⚔️ БОЕВОЙ"
-            heartbeat_msg = (
-                f"❤️ <b>Heartbeat</b>\n"
-                f"Режим: {mode}\n"
-                f"Последняя цена: {price:.2f}\n"
-                f"Состояние: Работаем, сигналов нет\n"
-                f"⏰ {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M:%S')} UTC"
-            )
-            send_telegram(heartbeat_msg)
+    # Heartbeat раз в час
+    if current_time - last_heartbeat_time >= HEARTBEAT_INTERVAL:
+        last_heartbeat_time = current_time
+        balance = okx_get_balance()
+        positions = okx_get_positions()
+        pos_info = f"Открытых позиций: {len(positions)}" if positions else "Позиций нет"
+        send_telegram(
+            f"❤️ <b>Heartbeat</b>\n\n"
+            f"Режим: {'🧪 ТЕСТ' if FORCE_TEST else '⚔️ БОЕВОЙ'}\n"
+            f"💰 Цена ETH: <b>{price:.2f}</b>\n"
+            f"💳 Баланс: {balance:.2f} USDT\n"
+            f"🌍 Сессия: {session['name']}\n"
+            f"₿ BTC тренд: {btc_trend}\n"
+            f"📊 {pos_info}\n"
+            f"📉 Потерь подряд: {losses_in_row}/{MAX_LOSSES_IN_ROW}\n"
+            f"⏰ {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC"
+        )
 
-    direction, entry, sl, tp, score, reason = get_signal(df, funding, ob)
+    direction, entry, sl, tp, score, reason = get_signal(
+        df, funding, ob, session["score_mod"], btc_trend
+    )
 
     log.info(f"Цена:{price:.2f} | {direction or 'нет'} | балл:{score}")
 
@@ -482,7 +572,7 @@ def run_scan():
     mode = "🧪 ТЕСТ" if FORCE_TEST else "⚔️ БОЕВОЙ"
 
     msg = [
-        f"<b>[{mode}]</b>",
+        f"<b>[{mode}] {session['name']}</b>",
         f"{arrow} <b>SCALP {direction}</b> {e}",
         f"",
         f"<b>Надёжность:</b> {score_bar(score)}",
@@ -491,12 +581,13 @@ def run_scan():
         f"🛑 Стоп: {sl:.2f} (-{abs(sl - entry):.2f}$)",
         f"🎯 Тейк: {tp:.2f} (+{abs(tp - entry):.2f}$)",
         f"📊 R/R: {abs(tp - entry) / max(abs(sl - entry), 0.01):.1f}",
+        f"₿ BTC: {btc_trend}",
         f"",
         f"📊 {reason}",
         f"",
     ]
 
-    now = time.time()
+    now = current_time
     cooldown = (now - last_trade_time) > COOLDOWN
     has_pos = len(okx_get_positions()) > 0
 
@@ -511,6 +602,7 @@ def run_scan():
         res = okx_place_order(direction, entry, sl, tp)
         if res["ok"]:
             last_trade_time = now
+            losses_in_row = 0
             algo_s = "✅" if res["algo_ok"] else "⚠️ частично"
             msg += [
                 f"✅ <b>ИСПОЛНЕНО НА OKX DEMO</b>",
@@ -519,6 +611,10 @@ def run_scan():
                 f"🆔 OrderID: {res['orderId']}",
             ]
         else:
+            losses_in_row += 1
+            if losses_in_row >= MAX_LOSSES_IN_ROW:
+                pause_until = now + PAUSE_AFTER_LOSSES
+                msg.append(f"⏸️ {MAX_LOSSES_IN_ROW} ошибки подряд — пауза {PAUSE_AFTER_LOSSES // 60} мин")
             msg += [
                 f"❌ Ошибка OKX [{res['step']}]:",
                 f"📝 {res['msg']}",
@@ -532,14 +628,20 @@ def bot_loop():
     balance = okx_get_balance()
     send_telegram(
         f"🚀 <b>OKX Scalp Bot</b>\n\n"
-        f"🎭 Режим: {'🧪 ТЕСТ (принудит. LONG)' if FORCE_TEST else '⚔️ БОЕВОЙ'}\n"
+        f"🎭 Режим: {'🧪 ТЕСТ' if FORCE_TEST else '⚔️ БОЕВОЙ'}\n"
         f"📊 Символ: {SYMBOL}\n"
         f"⚙️ Плечо: x{LEVERAGE}\n"
         f"💰 Сделка: {ORDER_USDT}$ USDT\n"
         f"💳 Баланс: {balance:.2f} USDT\n"
         f"🎯 Мин балл: {MIN_SCORE}/{MAX_SCORE}\n"
         f"⏱️ Скан: каждые {SCAN_INTERVAL // 60} мин\n\n"
-        f"{'🧪 ТЕСТ — ордер откроется принудительно!' if FORCE_TEST else '⚔️ Бот торгует автоматически!'}"
+        f"🛡️ <b>Новые защиты:</b>\n"
+        f"• Фильтр сессий (азиат/лондон/NY)\n"
+        f"• Корреляция BTC\n"
+        f"• ATR фильтр снизу\n"
+        f"• Динамика стакана\n"
+        f"• Пауза после {MAX_LOSSES_IN_ROW} ошибок\n"
+        f"• Heartbeat раз в час"
     )
 
     while True:
