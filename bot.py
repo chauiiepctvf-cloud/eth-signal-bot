@@ -359,8 +359,7 @@ def calc(df: pd.DataFrame) -> pd.DataFrame:
     df["BB_width"] = (df["BB_upper"] - df["BB_lower"]) / bm
 
     df["vol_avg"] = df["volume"].rolling(20).mean()
-    df["vol_spike"] = df["volume"] > df["vol_avg"] * 1.5
-
+    df["vol_spike"] = df["volume"] > df["vol_avg"] * 1.3  # было 1.5
     df["momentum"] = df["close"] - df["close"].shift(4)
     df["buy_ratio"] = df["taker_buy_base"] / df["volume"].replace(0, np.nan)
 
@@ -388,12 +387,12 @@ def get_signal(df, funding, ob, session_mod=0, btc_trend="NEUTRAL"):
         tp = round(entry + atr * 2.5, 2)
         return direction, entry, sl, tp, score, f"🧪 ТЕСТ | ATR:{atr:.2f} | Цена:{price:.2f}"
 
-    # Фильтр флэта (ужесточённый)
-    if row["BB_width"] < 0.008 and atr < price * 0.003:
+    # Фильтр флэта (ослаблен)
+    if row["BB_width"] < 0.006 and atr < price * 0.002:
         return None, None, None, None, 0, "Флэт (BB_width мал, ATR низкий)"
 
-    # Минимальная волатильность для входа
-    if atr < price * 0.003:
+    # Минимальная волатильность для входа (ослаблена)
+    if atr < price * 0.002:
         return None, None, None, None, 0, f"ATR слишком мал ({atr:.2f}) — нет движения"
 
     # Динамика стакана
@@ -435,12 +434,13 @@ def get_signal(df, funding, ob, session_mod=0, btc_trend="NEUTRAL"):
     elif funding > 0.003:
         S += 1
 
-    if ob > 8:
+    # Влияние стакана (ослаблено)
+    if ob > 5:
         L += 2
-    elif ob < -8:
+    elif ob < -5:
         S += 2
 
-    # Динамика стакана — усиливаем или ослабляем
+    # Динамика стакана
     if ob_trend == "RISING":
         L += 1
     if ob_trend == "FALLING":
@@ -456,11 +456,11 @@ def get_signal(df, funding, ob, session_mod=0, btc_trend="NEUTRAL"):
     elif row["buy_ratio"] < 0.45:
         S += 1
 
-    # Корреляция BTC
+    # Корреляция BTC (ослаблена)
     if btc_trend == "DOWN":
-        L -= 2   # BTC падает — не входим в лонг ETH
+        L -= 1
     elif btc_trend == "UP":
-        S -= 2   # BTC растёт — не входим в шорт ETH
+        S -= 1
 
     # Применяем модификатор сессии
     effective_min = MIN_SCORE + session_mod
@@ -635,7 +635,7 @@ def bot_loop():
         f"💳 Баланс: {balance:.2f} USDT\n"
         f"🎯 Мин балл: {MIN_SCORE}/{MAX_SCORE}\n"
         f"⏱️ Скан: каждые {SCAN_INTERVAL // 60} мин\n\n"
-        f"🛡️ <b>Новые защиты:</b>\n"
+        f"🛡️ <b>Защиты:</b>\n"
         f"• Фильтр сессий (азиат/лондон/NY)\n"
         f"• Корреляция BTC\n"
         f"• ATR фильтр снизу\n"
