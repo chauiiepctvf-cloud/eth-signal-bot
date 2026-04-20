@@ -40,7 +40,7 @@ TP_MULT = 2.0        # тейк = 2 ATR (R/R = 2:1)
 
 # ── ATR ФИЛЬТР ─────────────────────────────
 ATR_MIN_PCT = 0.001  # 0.1% — убираем только мёртвый рынок
-ATR_MAX_PCT = 0.05   # 5% — защита от кривых 데이터
+ATR_MAX_PCT = 0.05   # 5% — защита от кривых данных
 
 # ── ЗАЩИТЫ ─────────────────────────────────
 MAX_LOSSES = 4
@@ -314,56 +314,107 @@ def get_btc_momentum():
 def check_closed_positions():
     global stats, active_positions
     try:
-        current_positions = okx_get_positions()
-        current_order_ids = [p.get("ordId", "") for p in current_positions if p.get("ordId")]
+        # Получаем ИСТОРИЮ закрытых позиций за последние 24 часа
+        history = okx_get("/api/v5/trade/orders-history-archive", {
+            "instType": "SWAP",
+            "instId": SYMBOL,
+            "state": "filled",
+            "begin": str(int((time.time() - 86400) * 1000)),  # последние 24 часа
+            "end": str(int(time.time() * 1000)),
+            "limit": "50"
+        })
         
-        closed_orders = []
+        if history.get("code") != "0" or not history.get("data"):
+            return
+        
+        # Проверяем каждую нашу сохранённую позицию
         for order_id, pos_info in list(active_positions.items()):
-            if order_id not in current_order_ids:
-                closed_orders.append((order_id, pos_info))
-        
-        for order_id, pos_info in closed_orders:
+            # Ищем этот ордер в истории закрытых
+            closed_order = None
+            for h in history["data"]:
+                # Ордер мог быть частично закрыт — смотрим по ordId
+                if h.get("ordId") == order_id:
+                    closed_order = h
+                    break
+            
+            if not closed_order:
+                continue  # ещё открыта или не найдена
+            
+            # Позиция закрыта — считаем результат
             direction = pos_info["direction"]
             entry = pos_info["entry"]
-            tp = pos_info["tp"]
             sl = pos_info["sl"]
+            tp = pos_info["tp"]
+            qty = pos_info["qty"]
             
-            # Пытаемся определить результат по истории ордеров
-            try:
-                history = okx_get("/api/v5/trade/orders-history", {"instId": SYMBOL, "ordId": order_id})
-                if history.get("code") == "0" and history.get("data"):
-                    order_data = history["data"][0]
-                    fill_price = float(order_data.get("avgPx", entry))
-                    if fill_price >= tp:
-                        result = "TP"
-                        profit_pct = (tp - entry) / entry * 100
-                        profit_usdt = profit_pct / 100 * ORDER_USDT
-                        stats["wins"] += 1
-                        stats["total_profit"] += profit_usdt
-                        msg = f"✅ СДЕЛКА ЗАКРЫТА\nНаправление: {direction}\nПричина: ТЕЙК-ПРОФИТ\nПрибыль: +{profit_usdt:.2f} USDT (+{profit_pct:.2f}%)"
-                    elif fill_price <= sl:
-                        result = "SL"
-                        loss_pct = (entry - sl) / entry * 100
-                        loss_usdt = loss_pct / 100 * ORDER_USDT
-                        stats["losses"] += 1
-                        stats["total_profit"] -= loss_usdt
-                        msg = f"❌ СДЕЛКА ЗАКРЫТА\nНаправление: {direction}\nПричина: СТОП-ЛОСС\nУбыток: -{loss_usdt:.2f} USDT (-{loss_pct:.2f}%)"
-                    else:
-                        continue
-                else:
-                    continue
-            except:
+            avg_px = float(closed_order.get("avgPx", 0))
+            if avg_px == 0:
                 continue
             
+            # Определяем прибыль/убыток
+            if direction == "LONG":
+                pnl_pct = (avg_px - entry) / entry * 100
+            else:
+                pnl_pct = (entry - avg_px) / entry * 100
+            
+            pnl_usdt = pnl_pct / 100 * ORDER_USDT
+            
+            # Определяем причину закрытия
+            if direction == "LONG":
+                if avg_px >= tp:
+                    reason = "🎯 ТЕЙК-ПРОФИТ"
+                    stats["wins"] += 1
+                elif avg_px <= sl:
+                    reason = "🛑 СТОП-ЛОСС"
+                    stats["losses"] += 1
+                else:
+                    reason = "📊 РЫНОК"  # ручное закрытие или по времени
+                    if pnl_usdt > 0:
+                        stats["wins"] += 1
+                    else:
+                        stats["losses"] += 1
+            else:  # SHORT
+                if avg_px <= tp:
+                    reason = "🎯 ТЕЙК-ПРОФИТ"
+                    stats["wins"] += 1
+                elif avg_px >= sl:
+                    reason = "🛑 СТОП-ЛОСС"
+                    stats["losses"] += 1
+                else:
+                    reason = "📊 РЫНОК"
+                    if pnl_usdt > 0:
+                        stats["wins"] += 1
+                    else:
+                        stats["losses"] += 1
+            
             stats["total"] += 1
-            winrate = (stats["wins"] / stats["total"] * 100) if stats["total"] > 0 else 0
-            msg += f"\n\n📊 СТАТИСТИКА:\nВсего сделок: {stats['total']}\n✅ Прибыльных: {stats['wins']} ({winrate:.1f}%)\n❌ Убыточных: {stats['losses']}\n💰 Общий P&L: {stats['total_profit']:.2f} USDT"
-            send_telegram(msg)
+            stats["total_profit"] += pnl_usdt
             save_stats()
+            
+            winrate = (stats["wins"] / stats["total"] * 100) if stats["total"] > 0 else 0
+            emoji = "✅" if pnl_usdt > 0 else "❌"
+            
+            msg = (
+                f"{emoji} <b>СДЕЛКА ЗАКРЫТА</b>\n\n"
+                f"📈 Направление: {direction}\n"
+                f"💰 Вход: {entry:.2f}\n"
+                f"💵 Выход: {avg_px:.2f}\n"
+                f"📊 Причина: {reason}\n"
+                f"💎 P&L: {pnl_usdt:+.2f} USDT ({pnl_pct:+.2f}%)\n\n"
+                f"📈 <b>СТАТИСТИКА:</b>\n"
+                f"🔹 Всего сделок: {stats['total']}\n"
+                f"✅ Прибыльных: {stats['wins']} ({winrate:.1f}%)\n"
+                f"❌ Убыточных: {stats['losses']}\n"
+                f"💰 Общий P&L: {stats['total_profit']:.2f} USDT"
+            )
+            send_telegram(msg)
+            
+            log.info(f"Сделка закрыта: {direction} P&L: {pnl_usdt:.2f} USDT")
             del active_positions[order_id]
             save_active_positions()
+            
     except Exception as e:
-        log.error(f"Ошибка проверки позиций: {e}")
+        log.error(f"Ошибка проверки закрытых позиций: {e}")
 
 # ══════════════════════════════════════════════
 # ИНДИКАТОРЫ
