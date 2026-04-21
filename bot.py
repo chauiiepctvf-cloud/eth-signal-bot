@@ -809,6 +809,25 @@ def run_scan():
         else:
             session = "🇺🇸 Нью-Йорк"
         winrate = (stats["wins"] / stats["total"] * 100) if stats["total"] > 0 else 0
+        
+        # Получаем текущий балл (без открытия сделки)
+        direction, entry, sl, tp1, tp2, score, reason = get_signal(df, funding, ob, btc_mom, btc_dir)
+        
+        # Определяем L и S из reason (там есть "L:X.X S:Y.Y")
+        l_val = "?"
+        s_val = "?"
+        if "L:" in reason and "S:" in reason:
+            try:
+                parts = reason.split("|")[0]
+                l_part = parts.split("L:")[1].split(" ")[0]
+                s_part = parts.split("S:")[1].split(" ")[0]
+                l_val = l_part
+                s_val = s_part
+            except:
+                pass
+        
+        signal_status = f"{direction} ({score:.1f})" if direction else f"нет (макс {score:.1f})"
+        
         send_telegram(
             f"❤️ <b>Heartbeat</b>\n\n"
             f"💰 ETH: <b>{price:.2f}</b>\n"
@@ -816,11 +835,10 @@ def run_scan():
             f"🌍 Сессия: {session}\n"
             f"💳 Баланс: {bal:.2f} USDT\n"
             f"📊 Позиций: {len(pos)}\n"
-            f"📊 Статистика: {stats['total']} | ✅ {stats['wins']} ({winrate:.1f}%) | P&L: {stats['total_profit']:.2f} USDT"
+            f"🎯 Сигнал: {signal_status} | L:{l_val} S:{s_val}\n"
+            f"📊 Статистика: {stats['total']} | ✅ {stats['wins']} ({winrate:.1f}%) | P&L: {stats['total_profit']:.2f} USDT\n"
+            f"⏰ {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC"
         )
-
-    direction, entry, sl, tp1, tp2, score, reason = get_signal(df, funding, ob, btc_mom, btc_dir)
-    log.info(f"ETH:{price:.2f} | {direction or 'нет'} балл:{score:.1f}")
 
     if direction is None:
         return
