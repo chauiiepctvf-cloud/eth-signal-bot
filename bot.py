@@ -543,30 +543,88 @@ def get_liquidations():
 def check_closed_positions():
     global stats, active_positions
     try:
-        current_positions = okx_get_positions()
-        
         for order_id, pos_info in list(active_positions.items()):
+            history = okx_get("/api/v5/trade/orders-history-archive", {
+                "instType": "SWAP",
+                "instId": SYMBOL,
+                "state": "filled",
+                "begin": str(int((time.time() - 3600) * 1000)),
+                "end": str(int(time.time() * 1000)),
+                "limit": "50"
+            })
+            
+            if history.get("code") != "0" or not history.get("data"):
+                continue
+            
+            closed_orders = []
+            for h in history["data"]:
+                if (h.get("side") == pos_info["cls_side"] and 
+                    h.get("posSide") == pos_info["pos_side"] and
+                    h.get("state") == "filled"):
+                    closed_orders.append(h)
+            
+            if not closed_orders:
+                continue
+            
             direction = pos_info["direction"]
             entry = pos_info["entry"]
+            total_pnl = 0
+            close_reason = "📊 РЫНОК"
             
-            still_open = False
-            for p in current_positions:
-                if float(p.get("pos", 0)) != 0:
-                    still_open = True
-                    current_qty = float(p.get("pos", 0))
-                    if current_qty < pos_info.get("total_qty", 0) * 0.9:
-                        if pos_info.get("stage") == "open":
-                            pos_info["stage"] = "tp1_hit"
-                            save_active_positions()
-                            if pos_info.get("sl_order_id"):
-                                okx_amend_sl(pos_info["sl_order_id"], entry, pos_info["pos_side"], pos_info["cls_side"])
-                                log.info(f"🔒 Стоп → БУ: {entry:.2f}")
-                                send_telegram(
-                                    f"🎯 <b>ТЕЙК-1 (+{int(TP1_MARGIN_PCT*100)}% маржи)</b>\n"
-                                    f"📈 Закрыто {int(TP1_RATIO*100)}% {direction}\n"
-                                    f"💰 Стоп → вход ({entry:.2f})\n"
-                                    f"🎯 Ждём Тейк-2 (+{int(TP2_MARGIN_PCT*100)}%)"
-                                )
+            for h in closed_orders:
+                avg_px = float(h.get("avgPx", 0))
+                qty = float(h.get("sz", 0))
+                if avg_px > 0 and qty > 0:
+                    if direction == "LONG":
+                        pnl_pct = (avg_px - entry) / entry * 100
+                        if avg_px >= pos_info.get("tp2", 0) * 0.99:
+                            close_reason = f"🎯 ТЕЙК-2 (+{int(TP2_MARGIN_PCT*100)}%)"
+                        elif avg_px >= pos_info.get("tp1", 0) * 0.99:
+                            close_reason = f"🎯 ТЕЙК-1 (+{int(TP1_MARGIN_PCT*100)}%)"
+                        elif avg_px <= pos_info.get("sl", 0) * 1.01:
+                            close_reason = f"🛑 СТОП (-{int(SL_MARGIN_PCT*100)}%)"
+                    else:
+                        pnl_pct = (entry - avg_px) / entry * 100
+                        if avg_px <= pos_info.get("tp2", 0) * 1.01:
+                            close_reason = f"🎯 ТЕЙК-2 (+{int(TP2_MARGIN_PCT*100)}%)"
+                        elif avg_px <= pos_info.get("tp1", 0) * 1.01:
+                            close_reason = f"🎯 ТЕЙК-1 (+{int(TP1_MARGIN_PCT*100)}%)"
+                        elif avg_px >= pos_info.get("sl", 0) * 0.99:
+                            close_reason = f"🛑 СТОП (-{int(SL_MARGIN_PCT*100)}%)"
+                    
+                    position_value = ORDER_USDT * LEVERAGE * (qty / pos_info.get("total_qty", 1))
+                    pnl_usdt = pnl_pct / 100 * position_value
+                    total_pnl += pnl_usdt
+            
+            if total_pnl != 0:
+                if total_pnl > 0:
+                    stats["wins"] += 1
+                else:
+                    stats["losses"] += 1
+                
+                stats["total"] += 1
+                stats["total_profit"] += total_pnl
+                save_stats()
+                
+                winrate = (stats["wins"] / stats["total"] * 100) if stats["total"] > 0 else 0
+                emoji = "✅" if total_pnl > 0 else "❌"
+                
+                send_telegram(
+                    f"{emoji} <b>СДЕЛКА ЗАКРЫТА</b>\n\n"
+                    f"📈 Направление: {direction}\n"
+                    f"💰 Вход: {entry:.2f}\n"
+                    f"📊 Причина: {close_reason}\n"
+                    f"💎 P&L: {total_pnl:+.2f} USDT\n\n"
+                    f"📈 <b>СТАТИСТИКА:</b>\n"
+                    f"🔹 Всего: {stats['total']} | ✅ {stats['wins']} ({winrate:.1f}%) | P&L: {stats['total_profit']:.2f} USDT"
+                )
+                
+                log.info(f"Сделка закрыта: {direction} P&L: {total_pnl:.2f} USDT")
+                del active_positions[order_id]
+                save_active_positions()
+                
+    except Exception as e:
+        log.error(f"check_closed: {e}")
                     break
             
             if not still_open:
