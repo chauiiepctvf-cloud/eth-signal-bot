@@ -31,7 +31,7 @@ SCAN_INTERVAL = 3 * 60          # скан каждые 3 минуты
 HEARTBEAT_INTERVAL = 60 * 60    # раз в час
 
 # ── ПАРАМЕТРЫ СИГНАЛА ──────────────────────
-MIN_SCORE = 6      # повышенный порог
+MIN_SCORE = 6        # повышенный порог
 MAX_SCORE = 14       # максимум очков (увеличили из-за новых факторов)
 MIN_SCORE_DIFF = 3   # минимальная разница между L и S
 
@@ -755,7 +755,7 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
     return direction, entry, sl, tp1, tp2, score, reason
 
 # ══════════════════════════════════════════════
-# ШКАЛА БАЛЛОВ
+# ШКАЛА БАЛЛОВ (цветовая)
 # ══════════════════════════════════════════════
 def score_bar(score):
     filled = round(score / MAX_SCORE * 10)
@@ -767,6 +767,17 @@ def score_bar(score):
     else:
         emoji = "🔴"
     return f"{emoji} [{bar}] {score:.1f}/{MAX_SCORE}"
+
+def score_color(score):
+    """Возвращает HTML-цвет для балла"""
+    if score >= 8:
+        return "🟢"  # зелёный
+    elif score >= 6:
+        return "🟡"  # жёлтый
+    elif score >= 4:
+        return "🟠"  # оранжевый
+    else:
+        return "🔴"  # красный
 
 # ══════════════════════════════════════════════
 # ГЛАВНЫЙ ЦИКЛ
@@ -797,6 +808,10 @@ def run_scan():
     price = df.iloc[-1]["close"]
     atr_val = df.iloc[-1]["ATR"]
 
+    # Получаем сигнал ОДИН раз за цикл (до heartbeat)
+    direction, entry, sl, tp1, tp2, score, reason = get_signal(df, funding, ob, btc_mom, btc_dir)
+    log.info(f"ETH:{price:.2f} | {direction or 'нет'} балл:{score:.1f}")
+
     if now - last_heartbeat_time >= HEARTBEAT_INTERVAL:
         last_heartbeat_time = now
         bal = okx_get_balance()
@@ -810,32 +825,42 @@ def run_scan():
             session = "🇺🇸 Нью-Йорк"
         winrate = (stats["wins"] / stats["total"] * 100) if stats["total"] > 0 else 0
         
-        # Получаем текущий балл (без открытия сделки)
-        direction, entry, sl, tp1, tp2, score, reason = get_signal(df, funding, ob, btc_mom, btc_dir)
-        
-        # Определяем L и S из reason (там есть "L:X.X S:Y.Y")
+        # Определяем L и S из reason
         l_val = "?"
         s_val = "?"
+        l_num = 0.0
+        s_num = 0.0
         if "L:" in reason and "S:" in reason:
             try:
-                parts = reason.split("|")[0]
-                l_part = parts.split("L:")[1].split(" ")[0]
-                s_part = parts.split("S:")[1].split(" ")[0]
+                l_part = reason.split("L:")[1].split(" ")[0]
+                s_part = reason.split("S:")[1].split(" ")[0]
                 l_val = l_part
                 s_val = s_part
+                l_num = float(l_part)
+                s_num = float(s_part)
             except:
                 pass
         
-        signal_status = f"{direction} ({score:.1f})" if direction else f"нет (макс {score:.1f})"
+        # Цвета для баллов
+        l_color = "🟢" if l_num >= 6 else ("🟡" if l_num >= 4 else "🔴")
+        s_color = "🟢" if s_num >= 6 else ("🟡" if s_num >= 4 else "🔴")
+        
+        max_score_val = max(l_num, s_num)
+        max_color = "🟢" if max_score_val >= 6 else ("🟡" if max_score_val >= 4 else "🔴")
+        
+        if direction:
+            signal_status = f"{direction} {score_color(score)} <b>{score:.1f}</b>"
+        else:
+            signal_status = f"нет {max_color} <b>{max_score_val:.1f}</b>"
         
         send_telegram(
             f"❤️ <b>Heartbeat</b>\n\n"
             f"💰 ETH: <b>{price:.2f}</b>\n"
-            f"₿ BTC: {btc_mom:+.2f}% OB: {ob:+.1f}%\n"
+            f"₿ BTC: {btc_mom:+.2f}% | OB: {ob:+.1f}%\n"
             f"🌍 Сессия: {session}\n"
             f"💳 Баланс: {bal:.2f} USDT\n"
             f"📊 Позиций: {len(pos)}\n"
-            f"🎯 Сигнал: {signal_status} | L:{l_val} S:{s_val}\n"
+            f"🎯 Сигнал: {signal_status} | L: {l_color} {l_val} S: {s_color} {s_val}\n"
             f"📊 Статистика: {stats['total']} | ✅ {stats['wins']} ({winrate:.1f}%) | P&L: {stats['total_profit']:.2f} USDT\n"
             f"⏰ {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC"
         )
