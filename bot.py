@@ -370,7 +370,7 @@ def get_btc_momentum():
     try:
         df = get_klines(BTC_SYMBOL, "3m", 5)
         if df is None:
-            return 0.0, 0.0
+            return 0.0, 0
         chg = (df.iloc[-1]["close"] - df.iloc[-3]["close"]) / df.iloc[-3]["close"] * 100
         # Направление BTC (растёт или падает)
         btc_dir = 1 if df.iloc[-1]["close"] > df.iloc[-2]["close"] else -1
@@ -379,37 +379,27 @@ def get_btc_momentum():
         return 0.0, 0
 
 # ══════════════════════════════════════════════
-# ПРОВЕРКА ЗАКРЫТЫХ ПОЗИЦИЙ (с учётом дробного выхода)
+# ПРОВЕРКА ЗАКРЫТЫХ ПОЗИЦИЙ
 # ══════════════════════════════════════════════
 def check_closed_positions():
     global stats, active_positions
     try:
-        # Получаем текущие позиции
         current_positions = okx_get_positions()
-        current_pos_ids = []
-        for p in current_positions:
-            # OKX не возвращает ordId в позициях, отслеживаем по наличию позиции
-            current_pos_ids.append(p.get("posId", ""))
         
-        # Проверяем сохранённые позиции
         for order_id, pos_info in list(active_positions.items()):
             direction = pos_info["direction"]
             entry = pos_info["entry"]
             
-            # Проверяем, есть ли ещё открытая позиция
             still_open = False
             for p in current_positions:
                 if float(p.get("pos", 0)) != 0:
                     still_open = True
-                    # Проверяем, не изменился ли размер (частичное закрытие)
                     current_qty = float(p.get("pos", 0))
                     if current_qty < pos_info.get("total_qty", 0) * 0.9:
-                        # Частичное закрытие произошло
                         if pos_info.get("stage") == "open":
                             pos_info["stage"] = "tp1_hit"
                             save_active_positions()
                             
-                            # Переносим стоп в БУ
                             if pos_info.get("sl_order_id"):
                                 new_sl = entry
                                 okx_amend_sl(
@@ -429,7 +419,7 @@ def check_closed_positions():
                     break
             
             if not still_open:
-                # Позиция полностью закрыта — считаем результат
+                # Позиция полностью закрыта
                 history = okx_get("/api/v5/trade/orders-history-archive", {
                     "instType": "SWAP",
                     "instId": SYMBOL,
@@ -442,17 +432,11 @@ def check_closed_positions():
                 if history.get("code") != "0" or not history.get("data"):
                     continue
                 
-                # Ищем ордера, связанные с этой позицией
                 total_pnl = 0
                 closed_parts = 0
                 close_reason = "📊 РЫНОК"
                 
                 for h in history["data"]:
-                    # Смотрим ордера на закрытие
-                    if h.get("ordId") == order_id or h.get("clOrdId") == order_id:
-                        continue
-                    
-                    # Ищем закрывающие ордера
                     if h.get("side") == pos_info["cls_side"] and h.get("posSide") == pos_info["pos_side"]:
                         avg_px = float(h.get("avgPx", 0))
                         qty = float(h.get("sz", 0))
@@ -462,7 +446,6 @@ def check_closed_positions():
                             else:
                                 pnl_pct = (entry - avg_px) / entry * 100
                             
-                            # Определяем, какой это был тейк
                             if direction == "LONG":
                                 if avg_px >= pos_info.get("tp2", 0) * 0.99:
                                     close_reason = "🎯 ТЕЙК-2 (+100%)"
@@ -564,15 +547,10 @@ def calc(df):
     df["vol_ma"] = df["volume"].rolling(20).mean()
     df["vol_spike"] = df["volume"] > df["vol_ma"] * 1.3
     df["price_dir"] = df["close"].diff().apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
-    df["vol_dir"] = df["vol_spike"].astype(int) * df["price_dir"]  # +1 = объём вверх, -1 = объём вниз
-
-    # Моментум и taker ratio
-    df["mom"] = df["close"] - df["close"].shift(4)
-    df["buy_ratio"] = df["taker_buy_base"] / df["volume"].replace(0, np.nan)
+    df["vol_dir"] = df["vol_spike"].astype(int) * df["price_dir"]
 
     # Свечные паттерны
     body = (df["close"] - df["open"]).abs()
-    rng = df["high"] - df["low"] + 1e-9
     lw = df[["open", "close"]].min(axis=1) - df["low"]
     uw = df["high"] - df[["open", "close"]].max(axis=1)
     df["hammer"] = (lw > body * 2) & (uw < body * 0.5) & (df["close"] > df["open"])
@@ -580,12 +558,11 @@ def calc(df):
     return df
 
 # ══════════════════════════════════════════════
-# СИГНАЛ (со всеми улучшениями качества)
+# СИГНАЛ
 # ══════════════════════════════════════════════
 def get_signal(df, funding, ob, btc_mom, btc_dir):
     global ob_history, last_ob, yesterday_high, yesterday_low
     
-    # Проверка на достаточность данных
     if df is None or len(df) < 3:
         return None, None, None, None, None, 0, "Недостаточно данных"
     
@@ -594,13 +571,12 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
     rsi = row["RSI"]
     atr = row["ATR"]
     
-    # Проверка «свежести» свечи (должна быть старше 60 секунд)
+    # Проверка «свежести» свечи
     candle_time = row["candle_time"]
     seconds_since_open = (datetime.now(timezone.utc) - candle_time.replace(tzinfo=timezone.utc)).total_seconds()
     if seconds_since_open < 60:
         return None, None, None, None, None, 0, f"Свеча слишком новая ({int(seconds_since_open)}с)"
 
-    # FORCE TEST
     if FORCE_TEST:
         entry = price
         sl = round(entry * (1 - SL_PCT), 2)
@@ -608,26 +584,21 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
         tp2 = round(entry * (1 + TP2_PCT), 2)
         return "LONG", entry, sl, tp1, tp2, 10, f"🧪 ТЕСТ"
 
-    # Фильтр мёртвого рынка
     if atr < price * ATR_MIN_PCT:
         return None, None, None, None, None, 0, f"Рынок мёртвый (ATR {atr:.2f})"
-    if atr > price * ATR_MAX_PCT:
-        atr = price * 0.005
 
-    # Динамика стакана (дельта за 3 минуты)
+    # Динамика стакана
     ob_history.append(ob)
     if len(ob_history) > 6:
         ob_history.pop(0)
     ob_rising = len(ob_history) >= 3 and ob_history[-1] > ob_history[-3] + 2
     ob_falling = len(ob_history) >= 3 and ob_history[-1] < ob_history[-3] - 2
-    
-    # Дельта OB (изменение)
     ob_delta = ob - last_ob if last_ob != 0 else 0
     last_ob = ob
 
     L = S = 0.0
 
-    # ── 1. EMA тренд (вес 2) ──────────────────
+    # 1. EMA тренд
     if row["EMA9"] > row["EMA21"] > row["EMA50"]:
         L += 2
     elif row["EMA9"] < row["EMA21"] < row["EMA50"]:
@@ -637,7 +608,7 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
     elif row["EMA9"] < row["EMA21"]:
         S += 1
 
-    # ── 2. RSI (вес 2) ────────────────────────
+    # 2. RSI
     if rsi < 35:
         L += 2
     elif rsi < 45:
@@ -647,7 +618,7 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
     elif rsi > 55:
         S += 1
 
-    # ── 3. MACD пересечение (вес 2) ───────────
+    # 3. MACD
     if row["MACD_bull"]:
         L += 2
     elif row["MACD"] > row["MACD_sig"]:
@@ -657,38 +628,37 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
     elif row["MACD"] < row["MACD_sig"]:
         S += 1
 
-    # ── 4. CVD — поток денег (вес 1) ──────────
+    # 4. CVD
     if row["CVD_up"]:
         L += 1
     else:
         S += 1
 
-    # ── 5. Bollinger (вес 1) ──────────────────
+    # 5. Bollinger
     bp = row["BB_pct"]
     if bp < 0.1:
         L += 1
     elif bp > 0.9:
         S += 1
 
-    # ── 6. VWAP (вес 1) ───────────────────────
+    # 6. VWAP
     if price < row["VWAP"]:
         L += 1
     else:
         S += 1
 
-    # ── 7. Стакан + динамика (вес 1) ──────────
+    # 7. Стакан
     if ob > 5 or ob_rising:
         L += 1
     if ob < -5 or ob_falling:
         S += 1
     
-    # Дельта OB (дополнительный вес 0.5)
     if ob_delta > 3:
         L += 0.5
     elif ob_delta < -3:
         S += 0.5
 
-    # ── 8. BTC моментум и направление (вес 1) ─
+    # 8. BTC
     if btc_mom > 0.2:
         L += 1
         S = max(0, S - 1)
@@ -696,7 +666,6 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
         S += 1
         L = max(0, L - 1)
     
-    # Корреляция ETH/BTC по направлению
     eth_dir = 1 if row["close"] > df.iloc[-2]["close"] else -1
     if eth_dir == btc_dir and btc_dir != 0:
         if eth_dir == 1:
@@ -704,4 +673,222 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
         else:
             S += 0.5
     else:
-        # Дивер
+        if L > S:
+            L = max(0, L - 0.5)
+        else:
+            S = max(0, S - 0.5)
+
+    # 9. Объём
+    if row["vol_spike"]:
+        if row["vol_dir"] > 0:
+            L += 1
+        elif row["vol_dir"] < 0:
+            S += 1
+
+    # 10. Свечной паттерн
+    if row["hammer"]:
+        L += 1
+    if row["shooter"]:
+        S += 1
+
+    # Фандинг
+    if funding < -0.001:
+        L += 1
+    elif funding > 0.003:
+        S += 1
+
+    # Вчерашние уровни
+    if yesterday_high > 0 and yesterday_low > 0:
+        if price < yesterday_low:
+            L = max(0, L - 1)
+        elif price > yesterday_high:
+            S = max(0, S - 1)
+        elif price > yesterday_low and price < yesterday_low * 1.01:
+            L += 1
+        elif price < yesterday_high and price > yesterday_high * 0.99:
+            S += 1
+
+    # Сессия
+    hour = datetime.now(timezone.utc).hour
+    if 1 <= hour < 6:
+        if L >= S:
+            L = max(0, L - 1)
+        else:
+            S = max(0, S - 1)
+
+    # Бонус за конфлюэнцию
+    ema_long = row["EMA9"] > row["EMA21"] > row["EMA50"]
+    ema_short = row["EMA9"] < row["EMA21"] < row["EMA50"]
+    rsi_long = rsi < 45
+    rsi_short = rsi > 55
+    macd_long = row["MACD"] > row["MACD_sig"]
+    macd_short = row["MACD"] < row["MACD_sig"]
+    
+    if ema_long and rsi_long and macd_long:
+        L += 1.5
+    if ema_short and rsi_short and macd_short:
+        S += 1.5
+
+    # Выбор направления
+    long_signal = L >= MIN_SCORE and (L - S) >= MIN_SCORE_DIFF
+    short_signal = S >= MIN_SCORE and (S - L) >= MIN_SCORE_DIFF
+
+    if not long_signal and not short_signal:
+        return None, None, None, None, None, max(L, S), f"L:{L:.1f} S:{S:.1f} diff:{abs(L-S):.1f}"
+
+    entry = price
+    if long_signal:
+        direction = "LONG"
+        score = L
+        sl = round(entry * (1 - SL_PCT), 2)
+        tp1 = round(entry * (1 + TP1_PCT), 2)
+        tp2 = round(entry * (1 + TP2_PCT), 2)
+    else:
+        direction = "SHORT"
+        score = S
+        sl = round(entry * (1 + SL_PCT), 2)
+        tp1 = round(entry * (1 - TP1_PCT), 2)
+        tp2 = round(entry * (1 - TP2_PCT), 2)
+
+    log.info(f"{direction} балл:{score:.1f} | {entry:.2f} → SL:{sl:.2f} TP1:{tp1:.2f} TP2:{tp2:.2f}")
+    reason = f"Балл {score:.1f} | L:{L:.1f} S:{S:.1f} | RSI {rsi:.0f} | OB {ob:+.1f}%"
+    return direction, entry, sl, tp1, tp2, score, reason
+
+# ══════════════════════════════════════════════
+# ШКАЛА БАЛЛОВ
+# ══════════════════════════════════════════════
+def score_bar(score):
+    filled = round(score / MAX_SCORE * 10)
+    bar = "█" * filled + "░" * (10 - filled)
+    if score >= 10:
+        emoji = "🟢"
+    elif score >= 7:
+        emoji = "🟡"
+    else:
+        emoji = "🔴"
+    return f"{emoji} [{bar}] {score:.1f}/{MAX_SCORE}"
+
+# ══════════════════════════════════════════════
+# ГЛАВНЫЙ ЦИКЛ
+# ══════════════════════════════════════════════
+def run_scan():
+    global last_heartbeat_time, losses_in_row, pause_until, yesterday_high, yesterday_low
+    now = time.time()
+
+    if now < pause_until:
+        log.info(f"⏸️ Пауза — осталось {int((pause_until - now) / 60)} мин")
+        return
+
+    check_closed_positions()
+    
+    # Обновляем вчерашние уровни раз в час
+    if now - last_heartbeat_time >= 3600 or yesterday_high == 0:
+        yesterday_high, yesterday_low = get_yesterday_levels()
+
+    df = get_klines(SYMBOL_BN, "5m", 150)
+    if df is None:
+        send_telegram("❌ Ошибка свечей")
+        return
+
+    calc(df)
+    funding = get_funding()
+    ob = get_ob()
+    btc_mom, btc_dir = get_btc_momentum()
+    price = df.iloc[-1]["close"]
+    atr_val = df.iloc[-1]["ATR"]
+
+    if now - last_heartbeat_time >= HEARTBEAT_INTERVAL:
+        last_heartbeat_time = now
+        bal = okx_get_balance()
+        pos = okx_get_positions()
+        hour = datetime.now(timezone.utc).hour
+        if 1 <= hour < 6:
+            session = "🌙 Ночь"
+        elif hour < 13:
+            session = "🇬🇧 Лондон"
+        else:
+            session = "🇺🇸 Нью-Йорк"
+        winrate = (stats["wins"] / stats["total"] * 100) if stats["total"] > 0 else 0
+        send_telegram(
+            f"❤️ <b>Heartbeat</b>\n\n"
+            f"💰 ETH: <b>{price:.2f}</b>\n"
+            f"₿ BTC: {btc_mom:+.2f}% OB: {ob:+.1f}%\n"
+            f"🌍 Сессия: {session}\n"
+            f"💳 Баланс: {bal:.2f} USDT\n"
+            f"📊 Позиций: {len(pos)}\n"
+            f"📊 Статистика: {stats['total']} | ✅ {stats['wins']} ({winrate:.1f}%) | P&L: {stats['total_profit']:.2f} USDT"
+        )
+
+    direction, entry, sl, tp1, tp2, score, reason = get_signal(df, funding, ob, btc_mom, btc_dir)
+    log.info(f"ETH:{price:.2f} | {direction or 'нет'} балл:{score:.1f}")
+
+    if direction is None:
+        return
+
+    mode = "🧪 ТЕСТ" if FORCE_TEST else "⚔️ БОЕВОЙ"
+    msg = [
+        f"<b>[{mode}]</b>",
+        f"{'↗️' if direction == 'LONG' else '↘️'} <b>SCALP {direction}</b>",
+        f"",
+        f"<b>Надёжность:</b> {score_bar(score)}",
+        f"",
+        f"💰 Вход: <b>{entry:.2f}</b>",
+        f"🛑 Стоп: {sl:.2f} (-60%)",
+        f"🎯 Тейк-1: {tp1:.2f} (+40%) → 50% + БУ",
+        f"🎯 Тейк-2: {tp2:.2f} (+100%) → 50%",
+        f"",
+        f"📊 {reason}",
+    ]
+
+    has_pos = len(okx_get_positions()) > 0
+
+    if not OKX_API_KEY:
+        msg.append("⚠️ OKX_API_KEY не задан")
+    elif has_pos:
+        msg.append("⚠️ Позиция уже открыта")
+    else:
+        res = okx_place_order(direction, entry, sl, tp1, tp2)
+        if res["ok"]:
+            losses_in_row = 0
+            msg += [
+                f"✅ <b>ИСПОЛНЕНО</b>",
+                f"📦 Контрактов: {res['total_qty']}",
+                f"📊 TP1: {res['qty1']} | TP2: {res['qty2']}",
+            ]
+        else:
+            losses_in_row += 1
+            if losses_in_row >= MAX_LOSSES:
+                pause_until = now + PAUSE_LOSSES
+                msg.append(f"⏸️ Пауза {PAUSE_LOSSES // 60} мин")
+            msg += [f"❌ Ошибка: {res['msg']}"]
+
+    msg.append(f"\n⏰ {datetime.now(timezone.utc).strftime('%H:%M')} UTC")
+    send_telegram("\n".join(msg))
+
+def bot_loop():
+    log.info("🚀 Старт")
+    bal = okx_get_balance()
+    winrate = (stats["wins"] / stats["total"] * 100) if stats["total"] > 0 else 0
+    send_telegram(
+        f"🚀 <b>OKX Scalp Bot v2.0</b>\n\n"
+        f"🎭 Режим: {'🧪 ТЕСТ' if FORCE_TEST else '⚔️ БОЕВОЙ'}\n"
+        f"⚙️ Плечо: x{LEVERAGE}\n"
+        f"💰 Сделка: {ORDER_USDT} USDT\n"
+        f"🎯 Мин балл: {MIN_SCORE} (diff ≥ {MIN_SCORE_DIFF})\n"
+        f"📐 SL: -{int(SL_PCT*100)}% | TP1: +{int(TP1_PCT*100)}% | TP2: +{int(TP2_PCT*100)}%\n"
+        f"📊 Статистика: {stats['total']} | ✅ {stats['wins']} ({winrate:.1f}%)"
+    )
+
+    while True:
+        try:
+            run_scan()
+        except Exception as e:
+            log.error(f"Ошибка: {e}")
+            send_telegram(f"❌ Ошибка: {e}")
+        time.sleep(SCAN_INTERVAL)
+
+if __name__ == "__main__":
+    t = threading.Thread(target=bot_loop, daemon=True)
+    t.start()
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
