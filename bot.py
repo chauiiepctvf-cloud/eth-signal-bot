@@ -11,6 +11,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timezone, timedelta
 from flask import Flask
+from sklearn.ensemble import IsolationForest
 
 # ══════════════════════════════════════════════
 # НАСТРОЙКИ
@@ -30,7 +31,8 @@ ORDER_USDT = 20
 SCAN_INTERVAL = 3 * 60
 HEARTBEAT_INTERVAL = 60 * 60
 
-MIN_SCORE = 3.0
+# ── ТЕСТОВЫЕ НАСТРОЙКИ ──────────────────────
+MIN_SCORE = 2.0
 MAX_SCORE = 7.0
 MIN_SCORE_DIFF = 1.0
 
@@ -53,7 +55,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode = "🧪 ТЕСТ" if FORCE_TEST else "⚔️ БОЕВОЙ"
-    return f"OKX Scalp Bot v4.2 [{mode}] | {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC"
+    return f"OKX Scalp Bot v4.3 [{mode}] | {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC"
 
 last_heartbeat_time = 0
 losses_in_row = 0
@@ -64,6 +66,7 @@ yesterday_high = 0
 yesterday_low = 0
 force_test_done = False
 
+# Кэш
 cache = {
     "fear_greed": {"value": 50, "ts": 0},
     "long_short": {"value": 1.0, "ts": 0},
@@ -79,6 +82,7 @@ cache = {
     "gas_price": {"value": 20, "ts": 0},
     "btc_dominance": {"value": 50, "change": 0, "ts": 0},
     "total_mcap": {"value": 0, "change": 0, "ts": 0},
+    "microgpt": {"sentiment": 0.0, "confidence": 0, "ts": 0},
 }
 
 stats = {
@@ -224,7 +228,6 @@ def okx_cancel_algo(algo_id):
     })
 
 def okx_close_position_market(pos_side, total_qty):
-    """Принудительное закрытие по рынку"""
     cls_side = "sell" if pos_side == "long" else "buy"
     return okx_post("/api/v5/trade/order", {
         "instId": SYMBOL, "tdMode": "cross",
@@ -244,7 +247,6 @@ def okx_place_order(direction, entry, sl, tp, score):
     
     log.info(f"▶ {direction} qty={total_qty} entry={entry:.2f} sl={sl:.2f} tp={tp:.2f}")
     
-    # 1. Открываем позицию
     r = okx_post("/api/v5/trade/order", {
         "instId": SYMBOL, "tdMode": "cross",
         "side": side, "posSide": pos_side,
@@ -267,13 +269,12 @@ def okx_place_order(direction, entry, sl, tp, score):
         "multiplier": multiplier
     }
     save_active_positions()
-    time.sleep(3)  # Увеличил паузу
+    time.sleep(3)
     
-    # 2. Ставим SL и TP раздельно, с проверкой
     sl_ok = False
     tp_ok = False
     
-    # Пробуем до 3 раз поставить SL
+    # 3 попытки для SL
     for attempt in range(3):
         sl_r = okx_post("/api/v5/trade/order-algo", {
             "instId": SYMBOL, "tdMode": "cross",
@@ -291,7 +292,7 @@ def okx_place_order(direction, entry, sl, tp, score):
             log.warning(f"⚠️ SL попытка {attempt+1}: {sl_r.get('msg')}")
             time.sleep(1)
     
-    # Пробуем до 3 раз поставить TP
+    # 3 попытки для TP
     for attempt in range(3):
         tp_r = okx_post("/api/v5/trade/order-algo", {
             "instId": SYMBOL, "tdMode": "cross",
@@ -315,56 +316,6 @@ def okx_place_order(direction, entry, sl, tp, score):
         log.error(f"❌ SL НЕ УСТАНОВЛЕН после 3 попыток")
     if not tp_ok:
         log.error(f"❌ TP НЕ УСТАНОВЛЕН после 3 попыток")
-    
-    return {
-        "ok": True, "orderId": order_id, "total_qty": total_qty,
-        "algo_ok": sl_ok or tp_ok, "sl_ok": sl_ok, "tp_ok": tp_ok
-    }
-    
-    order_id = r["data"][0].get("ordId", "")
-    log.info(f"✅ Открыта позиция, ordId={order_id}")
-    
-    active_positions[order_id] = {
-        "direction": direction, "entry": entry, "sl": sl, "tp": tp,
-        "total_qty": total_qty, "pos_side": pos_side, "cls_side": cls_side,
-        "open_time": time.time(), "trailing_activated": False,
-        "sl_order_id": None, "tp_order_id": None,
-        "multiplier": multiplier
-    }
-    save_active_positions()
-    time.sleep(2)
-    
-    # 🎯 ИСПРАВЛЕНИЕ TP/SL: Используем TriggerRatio и явно указываем Last Price
-    sl_r = okx_post("/api/v5/trade/order-algo", {
-        "instId": SYMBOL, "tdMode": "cross",
-        "side": cls_side, "posSide": pos_side,
-        "ordType": "conditional", "sz": str(total_qty),
-        "slTriggerRatio": str(sl_ratio), "slOrdPx": "-1",
-        "slTriggerPxType": "last"
-    })
-    
-    tp_r = okx_post("/api/v5/trade/order-algo", {
-        "instId": SYMBOL, "tdMode": "cross",
-        "side": cls_side, "posSide": pos_side,
-        "ordType": "conditional", "sz": str(total_qty),
-        "tpTriggerRatio": str(tp_ratio), "tpOrdPx": "-1",
-        "tpTriggerPxType": "last"
-    })
-    
-    sl_ok = sl_r.get("code") == "0"
-    tp_ok = tp_r.get("code") == "0"
-    
-    if sl_ok:
-        active_positions[order_id]["sl_order_id"] = sl_r["data"][0].get("algoId", "")
-    if tp_ok:
-        active_positions[order_id]["tp_order_id"] = tp_r["data"][0].get("algoId", "")
-    
-    save_active_positions()
-    
-    if not sl_ok:
-        log.warning(f"⚠️ SL не установлен: {sl_r.get('msg')}")
-    if not tp_ok:
-        log.warning(f"⚠️ TP не установлен: {tp_r.get('msg')}")
     
     return {
         "ok": True, "orderId": order_id, "total_qty": total_qty,
@@ -491,10 +442,6 @@ def get_dxy():
     if now - cache["dxy"]["ts"] < 3600:
         return cache["dxy"]["value"], cache["dxy"]["change"]
     try:
-        r = requests.get(
-            "https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=usd",
-            timeout=10
-        )
         v = 100.0
         chg = 0.0
         cache["dxy"] = {"value": v, "change": chg, "ts": now}
@@ -507,7 +454,6 @@ def get_vix():
     if now - cache["vix"]["ts"] < 3600:
         return cache["vix"]["value"]
     try:
-        r = requests.get("https://api.coingecko.com/api/v3/global", timeout=10)
         v = 20.0
         cache["vix"] = {"value": v, "ts": now}
         return v
@@ -663,6 +609,45 @@ def get_eth_btc_correlation():
     except:
         return 1.0
 
+def get_microgpt_sentiment():
+    """MicroGPT API — предсказание направления"""
+    now = time.time()
+    if now - cache["microgpt"]["ts"] < 60:
+        return cache["microgpt"]["sentiment"], cache["microgpt"]["confidence"]
+    try:
+        r = requests.get("https://api.microgpt.ai/v1/predict?symbol=ETHUSDT&timeframe=5m", timeout=10)
+        data = r.json()
+        sentiment = data.get("sentiment", 0.0)
+        confidence = data.get("confidence", 0)
+        cache["microgpt"] = {"sentiment": sentiment, "confidence": confidence, "ts": now}
+        log.info(f"🤖 MicroGPT: sentiment={sentiment:.2f}, conf={confidence}%")
+        return sentiment, confidence
+    except Exception as e:
+        log.error(f"MicroGPT error: {e}")
+        return 0.0, 0
+
+def detect_whales_in_orderbook():
+    """Isolation Forest для поиска китов в стакане"""
+    try:
+        d = requests.get(f"https://api.binance.com/api/v3/depth?symbol={SYMBOL_BN}&limit=20", timeout=8).json()
+        bids = [[float(b[0]), float(b[1])] for b in d["bids"][:10]]
+        asks = [[float(a[0]), float(a[1])] for a in d["asks"][:10]]
+        X = np.array(bids + asks)
+        
+        if len(X) < 5:
+            return False
+        
+        model = IsolationForest(contamination=0.1, random_state=42)
+        preds = model.fit_predict(X)
+        
+        if -1 in preds:
+            log.info("🐋 Обнаружены киты в стакане")
+            return True
+        return False
+    except Exception as e:
+        log.error(f"Whale detection error: {e}")
+        return False
+
 def check_closed_positions():
     global stats, active_positions
     try:
@@ -675,7 +660,7 @@ def check_closed_positions():
             direction = pos_info["direction"]
             entry = pos_info["entry"]
             
-            # 1. Проверка трейлинга
+            # Проверка трейлинга
             if not pos_info.get("trailing_activated", False):
                 if direction == "LONG":
                     pnl_pct = (current_price - entry) / entry * 100
@@ -710,7 +695,7 @@ def check_closed_positions():
                             f"📊 Стоп движется за ценой (отступ {TRAILING_CALLBACK*100:.1f}%)"
                         )
 
-            # 2. 🎯 ПРОГРАММНЫЙ КОНТРОЛЬ (FALLBACK) — если цена ушла, а позиция висит
+            # Программный контроль (Fallback)
             still_open = False
             for p in current_positions:
                 if float(p.get("pos", 0)) != 0:
@@ -740,9 +725,9 @@ def check_closed_positions():
                     res = okx_close_position_market(pos_info["pos_side"], pos_info["total_qty"])
                     if res.get("code") == "0":
                         send_telegram(f"⚡ <b>FALLBACK ЗАКРЫТИЕ</b>\n{close_reason}")
-                        still_open = False # чтобы сработал блок расчета ниже
+                        still_open = False
             
-            # 3. Расчет результата, если позиция закрыта
+            # Расчёт результата
             if not still_open:
                 history = okx_get("/api/v5/trade/orders-history-archive", {
                     "instType": "SWAP", "instId": SYMBOL, "state": "filled",
@@ -754,7 +739,7 @@ def check_closed_positions():
                     continue
                 
                 total_pnl = 0
-                close_reason = "📊 РЫНОК"
+                close_reason = "📊 РЫНОК (ручное)"
                 
                 for h in history["data"]:
                     if h.get("side") == pos_info["cls_side"] and h.get("posSide") == pos_info["pos_side"]:
@@ -926,6 +911,8 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
     gas_price = get_gas_price()
     btc_dom, btc_dom_change = get_btc_dominance()
     total_mcap, total_mcap_change = get_total_mcap()
+    micro_sentiment, micro_conf = get_microgpt_sentiment()
+    whales = detect_whales_in_orderbook()
 
     L = S = 0.0
 
@@ -1190,6 +1177,23 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
     elif total_mcap_change < -1:
         S += 0.25
 
+    # 30. MicroGPT
+    if micro_conf >= 60:
+        if micro_sentiment > 0.5:
+            L += 0.5
+            log.info(f"🤖 MicroGPT LONG +0.5")
+        elif micro_sentiment < -0.5:
+            S += 0.5
+            log.info(f"🤖 MicroGPT SHORT +0.5")
+
+    # 31. Киты в стакане
+    if whales:
+        if L > S:
+            L = max(0, L - 0.25)
+        else:
+            S = max(0, S - 0.25)
+        log.info(f"🐋 Киты в стакане -0.25")
+
     long_signal = L >= MIN_SCORE and (L - S) >= MIN_SCORE_DIFF
     short_signal = S >= MIN_SCORE and (S - L) >= MIN_SCORE_DIFF
 
@@ -1212,7 +1216,7 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
         tp = round(entry * (1 - tp_pct), 2)
 
     log.info(f"{direction} {score:.1f}/7 | {entry:.2f} SL:{sl:.2f} TP:{tp:.2f}")
-    reason = f"L:{L:.1f} S:{S:.1f} | F&G:{fear_greed} | Corr:{corr:.2f}"
+    reason = f"L:{L:.1f} S:{S:.1f} | F&G:{fear_greed} | MicroGPT:{micro_sentiment:.2f}"
     return direction, entry, sl, tp, score, reason
 
 def score_bar(score):
@@ -1283,6 +1287,7 @@ def run_scan():
         gas = get_gas_price()
         btc_dom, _ = get_btc_dominance()
         corr = get_eth_btc_correlation()
+        micro_sent, micro_conf = get_microgpt_sentiment()
         important_day = is_important_economic_day()
         important_str = "⚠️ Важный день" if important_day else ""
         
@@ -1301,12 +1306,13 @@ def run_scan():
             signal_status = f"нет {score_color(max_score_val)} <b>{max_score_val:.1f}</b>"
         
         send_telegram(
-            f"❤️ <b>Heartbeat v4.2</b> {important_str}\n\n"
+            f"❤️ <b>Heartbeat v4.3</b> {important_str}\n\n"
             f"💰 ETH: <b>{price:.2f}</b>\n"
             f"😱 F&G: {fear_greed} | L/S: {long_short:.2f} | Corr: {corr:.2f}\n"
             f"🏦 CB: {cb_premium:+.3f}% | ETH/BTC: {eth_btc_chg:+.2f}%\n"
             f"💥 Liq: L={long_liq:.2f}M S={short_liq:.2f}M | Gas: {gas:.0f}\n"
             f"₿ BTC.D: {btc_dom:.1f}%\n"
+            f"🤖 MicroGPT: {micro_sent:+.2f} ({micro_conf}%)\n"
             f"🌍 Сессия: {session}\n"
             f"💳 Баланс: {bal:.2f} USDT | Поз: {len(pos)}\n"
             f"🎯 Сигнал: {signal_status} | L: {l_num:.1f} S: {s_num:.1f}\n"
@@ -1360,24 +1366,26 @@ def run_scan():
     send_telegram("\n".join(msg))
 
 def bot_loop():
-    log.info("🚀 Старт v4.2 FINAL")
+    log.info("🚀 Старт v4.3 — ИИ + Киты + Тест")
     bal = okx_get_balance()
     stats["current_equity"] = bal
     stats["peak_equity"] = bal
     winrate = (stats["wins"] / stats["total"] * 100) if stats["total"] > 0 else 0
     
     send_telegram(
-        f"🚀 <b>OKX Scalp Bot v4.2 FINAL</b>\n\n"
+        f"🚀 <b>OKX Scalp Bot v4.3</b>\n\n"
         f"🎭 Режим: {'🧪 ТЕСТ' if FORCE_TEST else '⚔️ БОЕВОЙ'}\n"
-        f"⚙️ Плечо: x{LEVERAGE} | Базовая сделка: {ORDER_USDT} USDT\n"
+        f"⚙️ Плечо: x{LEVERAGE} | Сделка: {ORDER_USDT} USDT\n"
         f"🎯 Мин балл: {MIN_SCORE}/7 (diff ≥ {MIN_SCORE_DIFF})\n"
         f"📐 SL: -{int(SL_MARGIN_PCT*100)}% | TP: +{int(TP_MARGIN_PCT*100)}%\n"
-        f"🔒 Трейлинг: +{int(TRAILING_ACTIVATE_PCT*100)}% (отступ {TRAILING_CALLBACK*100:.1f}%)\n"
+        f"🔒 Трейлинг: +{int(TRAILING_ACTIVATE_PCT*100)}%\n"
         f"📊 Статистика: {stats['total']} | ✅ {stats['wins']} | ❌ {stats['losses']} ({winrate:.1f}%)\n\n"
-        f"🆕 <b>Исправлено в v4.2:</b>\n"
-        f"• TP/SL через TriggerRatio (Last Price)\n"
-        f"• Программный контроль (Fallback)\n"
-        f"• Обнаружение ручного закрытия"
+        f"🆕 <b>Новое в v4.3:</b>\n"
+        f"• MicroGPT AI — предсказание направления\n"
+        f"• Isolation Forest — поиск китов в стакане\n"
+        f"• TP/SL с 3 попытками установки\n"
+        f"• Детект ручного закрытия\n"
+        f"• MIN_SCORE = 2.0 (тест сигналов)"
     )
 
     while True:
