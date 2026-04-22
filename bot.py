@@ -30,7 +30,7 @@ ORDER_USDT = 20
 SCAN_INTERVAL = 3 * 60
 HEARTBEAT_INTERVAL = 60 * 60
 
-MIN_SCORE = 4.0
+MIN_SCORE = 2.0
 MAX_SCORE = 7.0
 MIN_SCORE_DIFF = 1.5
 
@@ -53,7 +53,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode = "🧪 ТЕСТ" if FORCE_TEST else "⚔️ БОЕВОЙ"
-    return f"OKX Scalp Bot v4.1 [{mode}] | {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC"
+    return f"OKX Scalp Bot v4.2 [{mode}] | {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC"
 
 last_heartbeat_time = 0
 losses_in_row = 0
@@ -223,6 +223,15 @@ def okx_cancel_algo(algo_id):
         "instId": SYMBOL, "algoId": algo_id
     })
 
+def okx_close_position_market(pos_side, total_qty):
+    """Принудительное закрытие по рынку"""
+    cls_side = "sell" if pos_side == "long" else "buy"
+    return okx_post("/api/v5/trade/order", {
+        "instId": SYMBOL, "tdMode": "cross",
+        "side": cls_side, "posSide": pos_side,
+        "ordType": "market", "sz": str(total_qty)
+    })
+
 def okx_place_order(direction, entry, sl, tp, score):
     okx_set_leverage()
     side = "buy" if direction == "LONG" else "sell"
@@ -233,7 +242,11 @@ def okx_place_order(direction, entry, sl, tp, score):
     effective_usdt = ORDER_USDT * multiplier
     total_qty = max(1, round(effective_usdt * LEVERAGE / entry / 0.01))
     
-    log.info(f"▶ {direction} qty={total_qty} entry={entry:.2f} sl={sl:.2f} tp={tp:.2f}")
+    # Расчет процентных отклонений для TriggerRatio
+    sl_ratio = -round(SL_MARGIN_PCT / LEVERAGE, 4)
+    tp_ratio = round(TP_MARGIN_PCT / LEVERAGE, 4)
+    
+    log.info(f"▶ {direction} qty={total_qty} entry={entry:.2f} sl_ratio={sl_ratio} tp_ratio={tp_ratio}")
     
     r = okx_post("/api/v5/trade/order", {
         "instId": SYMBOL, "tdMode": "cross",
@@ -259,21 +272,20 @@ def okx_place_order(direction, entry, sl, tp, score):
     save_active_positions()
     time.sleep(2)
     
-    # Ставим SL
+    # 🎯 ИСПРАВЛЕНИЕ TP/SL: Используем TriggerRatio и явно указываем Last Price
     sl_r = okx_post("/api/v5/trade/order-algo", {
         "instId": SYMBOL, "tdMode": "cross",
         "side": cls_side, "posSide": pos_side,
         "ordType": "conditional", "sz": str(total_qty),
-        "slTriggerPx": str(round(sl, 2)), "slOrdPx": "-1",
+        "slTriggerRatio": str(sl_ratio), "slOrdPx": "-1",
         "slTriggerPxType": "last"
     })
     
-    # Ставим TP
     tp_r = okx_post("/api/v5/trade/order-algo", {
         "instId": SYMBOL, "tdMode": "cross",
         "side": cls_side, "posSide": pos_side,
         "ordType": "conditional", "sz": str(total_qty),
-        "tpTriggerPx": str(round(tp, 2)), "tpOrdPx": "-1",
+        "tpTriggerRatio": str(tp_ratio), "tpOrdPx": "-1",
         "tpTriggerPxType": "last"
     })
     
@@ -421,7 +433,6 @@ def get_dxy():
             "https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=usd",
             timeout=10
         )
-        # Используем USDT как прокси для DXY (обратная корреляция)
         v = 100.0
         chg = 0.0
         cache["dxy"] = {"value": v, "change": chg, "ts": now}
@@ -435,7 +446,6 @@ def get_vix():
         return cache["vix"]["value"]
     try:
         r = requests.get("https://api.coingecko.com/api/v3/global", timeout=10)
-        # VIX эмулируем через волатильность рынка
         v = 20.0
         cache["vix"] = {"value": v, "ts": now}
         return v
@@ -603,7 +613,7 @@ def check_closed_positions():
             direction = pos_info["direction"]
             entry = pos_info["entry"]
             
-            # Проверка трейлинга
+            # 1. Проверка трейлинга
             if not pos_info.get("trailing_activated", False):
                 if direction == "LONG":
                     pnl_pct = (current_price - entry) / entry * 100
@@ -615,13 +625,11 @@ def check_closed_positions():
                 if margin_pnl_pct >= TRAILING_ACTIVATE_PCT * 100:
                     log.info(f"🎯 Активируем трейлинг, P&L={margin_pnl_pct:.1f}% маржи")
                     
-                    # Отменяем старые ордера
                     if pos_info.get("sl_order_id"):
                         okx_cancel_algo(pos_info["sl_order_id"])
                     if pos_info.get("tp_order_id"):
                         okx_cancel_algo(pos_info["tp_order_id"])
                     
-                    # Ставим трейлинг
                     trail = okx_post("/api/v5/trade/order-algo", {
                         "instId": SYMBOL, "tdMode": "cross",
                         "side": pos_info["cls_side"], "posSide": pos_info["pos_side"],
@@ -639,14 +647,40 @@ def check_closed_positions():
                             f"💰 Текущий P&L: +{margin_pnl_pct:.1f}% маржи\n"
                             f"📊 Стоп движется за ценой (отступ {TRAILING_CALLBACK*100:.1f}%)"
                         )
-            
-            # Проверка закрытия
+
+            # 2. 🎯 ПРОГРАММНЫЙ КОНТРОЛЬ (FALLBACK) — если цена ушла, а позиция висит
             still_open = False
             for p in current_positions:
                 if float(p.get("pos", 0)) != 0:
                     still_open = True
                     break
             
+            if still_open:
+                should_close = False
+                close_reason = ""
+                if direction == "LONG":
+                    if current_price >= pos_info["tp"]:
+                        should_close = True
+                        close_reason = f"🎯 ТЕЙК (программно, {current_price:.2f} >= {pos_info['tp']:.2f})"
+                    elif current_price <= pos_info["sl"]:
+                        should_close = True
+                        close_reason = f"🛑 СТОП (программно, {current_price:.2f} <= {pos_info['sl']:.2f})"
+                else:
+                    if current_price <= pos_info["tp"]:
+                        should_close = True
+                        close_reason = f"🎯 ТЕЙК (программно, {current_price:.2f} <= {pos_info['tp']:.2f})"
+                    elif current_price >= pos_info["sl"]:
+                        should_close = True
+                        close_reason = f"🛑 СТОП (программно, {current_price:.2f} >= {pos_info['sl']:.2f})"
+                
+                if should_close:
+                    log.warning(f"⚠️ Fallback: {close_reason}. Закрываем принудительно.")
+                    res = okx_close_position_market(pos_info["pos_side"], pos_info["total_qty"])
+                    if res.get("code") == "0":
+                        send_telegram(f"⚡ <b>FALLBACK ЗАКРЫТИЕ</b>\n{close_reason}")
+                        still_open = False # чтобы сработал блок расчета ниже
+            
+            # 3. Расчет результата, если позиция закрыта
             if not still_open:
                 history = okx_get("/api/v5/trade/orders-history-archive", {
                     "instType": "SWAP", "instId": SYMBOL, "state": "filled",
@@ -1205,7 +1239,7 @@ def run_scan():
             signal_status = f"нет {score_color(max_score_val)} <b>{max_score_val:.1f}</b>"
         
         send_telegram(
-            f"❤️ <b>Heartbeat v4.1</b> {important_str}\n\n"
+            f"❤️ <b>Heartbeat v4.2</b> {important_str}\n\n"
             f"💰 ETH: <b>{price:.2f}</b>\n"
             f"😱 F&G: {fear_greed} | L/S: {long_short:.2f} | Corr: {corr:.2f}\n"
             f"🏦 CB: {cb_premium:+.3f}% | ETH/BTC: {eth_btc_chg:+.2f}%\n"
@@ -1264,25 +1298,24 @@ def run_scan():
     send_telegram("\n".join(msg))
 
 def bot_loop():
-    log.info("🚀 Старт v4.1 FINAL")
+    log.info("🚀 Старт v4.2 FINAL")
     bal = okx_get_balance()
     stats["current_equity"] = bal
     stats["peak_equity"] = bal
     winrate = (stats["wins"] / stats["total"] * 100) if stats["total"] > 0 else 0
     
     send_telegram(
-        f"🚀 <b>OKX Scalp Bot v4.1 FINAL</b>\n\n"
+        f"🚀 <b>OKX Scalp Bot v4.2 FINAL</b>\n\n"
         f"🎭 Режим: {'🧪 ТЕСТ' if FORCE_TEST else '⚔️ БОЕВОЙ'}\n"
         f"⚙️ Плечо: x{LEVERAGE} | Базовая сделка: {ORDER_USDT} USDT\n"
         f"🎯 Мин балл: {MIN_SCORE}/7 (diff ≥ {MIN_SCORE_DIFF})\n"
         f"📐 SL: -{int(SL_MARGIN_PCT*100)}% | TP: +{int(TP_MARGIN_PCT*100)}%\n"
         f"🔒 Трейлинг: +{int(TRAILING_ACTIVATE_PCT*100)}% (отступ {TRAILING_CALLBACK*100:.1f}%)\n"
         f"📊 Статистика: {stats['total']} | ✅ {stats['wins']} | ❌ {stats['losses']} ({winrate:.1f}%)\n\n"
-        f"🆕 <b>Исправлено в v4.1:</b>\n"
-        f"• Раздельные SL/TP ордера\n"
-        f"• Детальная статистика (+/- суммы)\n"
-        f"• Ручное закрытие учитывается\n"
-        f"• Yahoo Finance заменён"
+        f"🆕 <b>Исправлено в v4.2:</b>\n"
+        f"• TP/SL через TriggerRatio (Last Price)\n"
+        f"• Программный контроль (Fallback)\n"
+        f"• Обнаружение ручного закрытия"
     )
 
     while True:
