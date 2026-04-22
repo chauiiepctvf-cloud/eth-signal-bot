@@ -242,12 +242,9 @@ def okx_place_order(direction, entry, sl, tp, score):
     effective_usdt = ORDER_USDT * multiplier
     total_qty = max(1, round(effective_usdt * LEVERAGE / entry / 0.01))
     
-    # Расчет процентных отклонений для TriggerRatio
-    sl_ratio = -round(SL_MARGIN_PCT / LEVERAGE, 4)
-    tp_ratio = round(TP_MARGIN_PCT / LEVERAGE, 4)
+    log.info(f"▶ {direction} qty={total_qty} entry={entry:.2f} sl={sl:.2f} tp={tp:.2f}")
     
-    log.info(f"▶ {direction} qty={total_qty} entry={entry:.2f} sl_ratio={sl_ratio} tp_ratio={tp_ratio}")
-    
+    # 1. Открываем позицию
     r = okx_post("/api/v5/trade/order", {
         "instId": SYMBOL, "tdMode": "cross",
         "side": side, "posSide": pos_side,
@@ -258,6 +255,71 @@ def okx_place_order(direction, entry, sl, tp, score):
         if r.get("data") and len(r["data"]) > 0:
             msg = r["data"][0].get("sMsg", msg)
         return {"ok": False, "step": "open", "msg": msg}
+    
+    order_id = r["data"][0].get("ordId", "")
+    log.info(f"✅ Открыта позиция, ordId={order_id}")
+    
+    active_positions[order_id] = {
+        "direction": direction, "entry": entry, "sl": sl, "tp": tp,
+        "total_qty": total_qty, "pos_side": pos_side, "cls_side": cls_side,
+        "open_time": time.time(), "trailing_activated": False,
+        "sl_order_id": None, "tp_order_id": None,
+        "multiplier": multiplier
+    }
+    save_active_positions()
+    time.sleep(3)  # Увеличил паузу
+    
+    # 2. Ставим SL и TP раздельно, с проверкой
+    sl_ok = False
+    tp_ok = False
+    
+    # Пробуем до 3 раз поставить SL
+    for attempt in range(3):
+        sl_r = okx_post("/api/v5/trade/order-algo", {
+            "instId": SYMBOL, "tdMode": "cross",
+            "side": cls_side, "posSide": pos_side,
+            "ordType": "conditional", "sz": str(total_qty),
+            "slTriggerPx": str(round(sl, 2)), "slOrdPx": "-1",
+            "slTriggerPxType": "last"
+        })
+        if sl_r.get("code") == "0":
+            active_positions[order_id]["sl_order_id"] = sl_r["data"][0].get("algoId", "")
+            sl_ok = True
+            log.info(f"✅ SL установлен: {sl:.2f}")
+            break
+        else:
+            log.warning(f"⚠️ SL попытка {attempt+1}: {sl_r.get('msg')}")
+            time.sleep(1)
+    
+    # Пробуем до 3 раз поставить TP
+    for attempt in range(3):
+        tp_r = okx_post("/api/v5/trade/order-algo", {
+            "instId": SYMBOL, "tdMode": "cross",
+            "side": cls_side, "posSide": pos_side,
+            "ordType": "conditional", "sz": str(total_qty),
+            "tpTriggerPx": str(round(tp, 2)), "tpOrdPx": "-1",
+            "tpTriggerPxType": "last"
+        })
+        if tp_r.get("code") == "0":
+            active_positions[order_id]["tp_order_id"] = tp_r["data"][0].get("algoId", "")
+            tp_ok = True
+            log.info(f"✅ TP установлен: {tp:.2f}")
+            break
+        else:
+            log.warning(f"⚠️ TP попытка {attempt+1}: {tp_r.get('msg')}")
+            time.sleep(1)
+    
+    save_active_positions()
+    
+    if not sl_ok:
+        log.error(f"❌ SL НЕ УСТАНОВЛЕН после 3 попыток")
+    if not tp_ok:
+        log.error(f"❌ TP НЕ УСТАНОВЛЕН после 3 попыток")
+    
+    return {
+        "ok": True, "orderId": order_id, "total_qty": total_qty,
+        "algo_ok": sl_ok or tp_ok, "sl_ok": sl_ok, "tp_ok": tp_ok
+    }
     
     order_id = r["data"][0].get("ordId", "")
     log.info(f"✅ Открыта позиция, ordId={order_id}")
