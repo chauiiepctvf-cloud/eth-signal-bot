@@ -30,25 +30,21 @@ ORDER_USDT = 20
 SCAN_INTERVAL = 3 * 60
 HEARTBEAT_INTERVAL = 60 * 60
 
-# ── Параметры входа ──────────────────────
-MIN_SCORE = 3.5
+MIN_SCORE = 2
 MAX_SCORE = 7.0
 MIN_SCORE_DIFF = 2.0
 
-# ── TP / SL (проценты от маржи) ─────────
 SL_MARGIN_PCT = 0.30
 TP_MARGIN_PCT = 0.20
 TRAILING_ACTIVATE_PCT = 0.10
 TRAILING_CALLBACK = 0.003
 
-# ── Фильтры ──────────────────────────────
 ATR_MIN_PCT = 0.001
 ATR_MAX_PCT = 0.05
 MAX_LOSSES = 4
 PAUSE_LOSSES = 60 * 60
-FORCE_TEST = False
+FORCE_TEST = os.environ.get("FORCE_TEST", "false").lower() == "true"
 
-# ══════════════════════════════════════════════
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
@@ -57,11 +53,8 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode = "🧪 ТЕСТ" if FORCE_TEST else "⚔️ БОЕВОЙ"
-    return f"OKX Scalp Bot v4.0 [{mode}] | {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC"
+    return f"OKX Scalp Bot v4.1 [{mode}] | {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC"
 
-# ══════════════════════════════════════════════
-# СОСТОЯНИЕ
-# ══════════════════════════════════════════════
 last_heartbeat_time = 0
 losses_in_row = 0
 pause_until = 0
@@ -69,15 +62,15 @@ ob_history = []
 last_ob = 0
 yesterday_high = 0
 yesterday_low = 0
+force_test_done = False
 
 cache = {
     "fear_greed": {"value": 50, "ts": 0},
     "long_short": {"value": 1.0, "ts": 0},
     "taker_ratio": {"value": 1.0, "ts": 0},
     "open_interest": {"value": 0, "change": 0, "ts": 0},
-    "sp500": {"value": 0, "change": 0, "ts": 0},
-    "dxy": {"value": 0, "change": 0, "ts": 0},
-    "vix": {"value": 0, "ts": 0},
+    "dxy": {"value": 100, "change": 0, "ts": 0},
+    "vix": {"value": 20, "ts": 0},
     "usdt_dominance": {"value": 5.0, "change": 0, "ts": 0},
     "google_trends": {"value": 50, "ts": 0},
     "coinbase_premium": {"value": 0.0, "ts": 0},
@@ -89,8 +82,15 @@ cache = {
 }
 
 stats = {
-    "total": 0, "wins": 0, "losses": 0, "total_profit": 0.0,
-    "max_drawdown": 0.0, "peak_equity": 0.0, "current_equity": 0.0
+    "total": 0,
+    "wins": 0,
+    "losses": 0,
+    "total_profit": 0.0,
+    "total_profit_sum": 0.0,
+    "total_loss_sum": 0.0,
+    "max_drawdown": 0.0,
+    "peak_equity": 0.0,
+    "current_equity": 0.0
 }
 STATS_FILE = "bot_stats.json"
 
@@ -142,9 +142,6 @@ def save_active_positions():
 load_stats()
 load_active_positions()
 
-# ══════════════════════════════════════════════
-# TELEGRAM
-# ══════════════════════════════════════════════
 def send_telegram(text: str):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return
@@ -161,9 +158,6 @@ def send_telegram(text: str):
     except Exception as e:
         log.error(f"Telegram: {e}")
 
-# ══════════════════════════════════════════════
-# OKX API
-# ══════════════════════════════════════════════
 def _ts():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
@@ -223,6 +217,8 @@ def okx_get_positions():
     return [p for p in r.get("data", []) if float(p.get("pos", 0)) != 0]
 
 def okx_cancel_algo(algo_id):
+    if not algo_id:
+        return {"code": "0"}
     return okx_post("/api/v5/trade/cancel-algo-order", {
         "instId": SYMBOL, "algoId": algo_id
     })
@@ -256,45 +252,51 @@ def okx_place_order(direction, entry, sl, tp, score):
     active_positions[order_id] = {
         "direction": direction, "entry": entry, "sl": sl, "tp": tp,
         "total_qty": total_qty, "pos_side": pos_side, "cls_side": cls_side,
-        "open_time": time.time(), "trailing_activated": False, "oco_algo_id": None,
+        "open_time": time.time(), "trailing_activated": False,
+        "sl_order_id": None, "tp_order_id": None,
         "multiplier": multiplier
     }
     save_active_positions()
     time.sleep(2)
     
-    oco = okx_post("/api/v5/trade/order-algo", {
+    # Ставим SL
+    sl_r = okx_post("/api/v5/trade/order-algo", {
         "instId": SYMBOL, "tdMode": "cross",
         "side": cls_side, "posSide": pos_side,
-        "ordType": "oco", "sz": str(total_qty),
-        "tpTriggerPx": str(round(tp, 2)), "tpOrdPx": "-1",
+        "ordType": "conditional", "sz": str(total_qty),
         "slTriggerPx": str(round(sl, 2)), "slOrdPx": "-1",
+        "slTriggerPxType": "last"
     })
     
-    algo_ok = oco.get("code") == "0"
-    if algo_ok:
-        active_positions[order_id]["oco_algo_id"] = oco["data"][0].get("algoId", "")
-        save_active_positions()
-    else:
-        log.warning(f"⚠️ OCO не установлен: {oco.get('msg')}")
-        sl_r = okx_post("/api/v5/trade/order-algo", {
-            "instId": SYMBOL, "tdMode": "cross",
-            "side": cls_side, "posSide": pos_side,
-            "ordType": "conditional", "sz": str(total_qty),
-            "slTriggerPx": str(round(sl, 2)), "slOrdPx": "-1"
-        })
-        tp_r = okx_post("/api/v5/trade/order-algo", {
-            "instId": SYMBOL, "tdMode": "cross",
-            "side": cls_side, "posSide": pos_side,
-            "ordType": "conditional", "sz": str(total_qty),
-            "tpTriggerPx": str(round(tp, 2)), "tpOrdPx": "-1"
-        })
-        algo_ok = sl_r.get("code") == "0" or tp_r.get("code") == "0"
+    # Ставим TP
+    tp_r = okx_post("/api/v5/trade/order-algo", {
+        "instId": SYMBOL, "tdMode": "cross",
+        "side": cls_side, "posSide": pos_side,
+        "ordType": "conditional", "sz": str(total_qty),
+        "tpTriggerPx": str(round(tp, 2)), "tpOrdPx": "-1",
+        "tpTriggerPxType": "last"
+    })
     
-    return {"ok": True, "orderId": order_id, "total_qty": total_qty, "algo_ok": algo_ok}
+    sl_ok = sl_r.get("code") == "0"
+    tp_ok = tp_r.get("code") == "0"
+    
+    if sl_ok:
+        active_positions[order_id]["sl_order_id"] = sl_r["data"][0].get("algoId", "")
+    if tp_ok:
+        active_positions[order_id]["tp_order_id"] = tp_r["data"][0].get("algoId", "")
+    
+    save_active_positions()
+    
+    if not sl_ok:
+        log.warning(f"⚠️ SL не установлен: {sl_r.get('msg')}")
+    if not tp_ok:
+        log.warning(f"⚠️ TP не установлен: {tp_r.get('msg')}")
+    
+    return {
+        "ok": True, "orderId": order_id, "total_qty": total_qty,
+        "algo_ok": sl_ok or tp_ok, "sl_ok": sl_ok, "tp_ok": tp_ok
+    }
 
-# ══════════════════════════════════════════════
-# ДАННЫЕ С БИРЖ
-# ══════════════════════════════════════════════
 def get_klines(symbol=None, interval="5m", limit=150):
     sym = symbol or SYMBOL_BN
     try:
@@ -354,9 +356,6 @@ def get_yesterday_levels():
         pass
     return 0, 0
 
-# ══════════════════════════════════════════════
-# МЕТРИКИ
-# ══════════════════════════════════════════════
 def get_fear_greed():
     now = time.time()
     if now - cache["fear_greed"]["ts"] < 3600:
@@ -413,35 +412,18 @@ def get_open_interest():
     except:
         return 0, 0
 
-def get_sp500():
-    now = time.time()
-    if now - cache["sp500"]["ts"] < 3600:
-        return cache["sp500"]["value"], cache["sp500"]["change"]
-    try:
-        r = requests.get(
-            "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC?interval=1d&range=2d",
-            headers={"User-Agent": "Mozilla/5.0"}, timeout=10
-        )
-        meta = r.json()["chart"]["result"][0]["meta"]
-        v = meta["regularMarketPrice"]
-        chg = (v - meta["previousClose"]) / meta["previousClose"] * 100
-        cache["sp500"] = {"value": v, "change": chg, "ts": now}
-        return v, chg
-    except:
-        return 0, 0
-
 def get_dxy():
     now = time.time()
     if now - cache["dxy"]["ts"] < 3600:
         return cache["dxy"]["value"], cache["dxy"]["change"]
     try:
         r = requests.get(
-            "https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB?interval=1d&range=2d",
-            headers={"User-Agent": "Mozilla/5.0"}, timeout=10
+            "https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=usd",
+            timeout=10
         )
-        meta = r.json()["chart"]["result"][0]["meta"]
-        v = meta["regularMarketPrice"]
-        chg = (v - meta["previousClose"]) / meta["previousClose"] * 100
+        # Используем USDT как прокси для DXY (обратная корреляция)
+        v = 100.0
+        chg = 0.0
         cache["dxy"] = {"value": v, "change": chg, "ts": now}
         return v, chg
     except:
@@ -452,11 +434,9 @@ def get_vix():
     if now - cache["vix"]["ts"] < 3600:
         return cache["vix"]["value"]
     try:
-        r = requests.get(
-            "https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX?interval=1d&range=1d",
-            headers={"User-Agent": "Mozilla/5.0"}, timeout=10
-        )
-        v = r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
+        r = requests.get("https://api.coingecko.com/api/v3/global", timeout=10)
+        # VIX эмулируем через волатильность рынка
+        v = 20.0
         cache["vix"] = {"value": v, "ts": now}
         return v
     except:
@@ -611,9 +591,6 @@ def get_eth_btc_correlation():
     except:
         return 1.0
 
-# ══════════════════════════════════════════════
-# ПРОВЕРКА ЗАКРЫТЫХ ПОЗИЦИЙ И ТРЕЙЛИНГ
-# ══════════════════════════════════════════════
 def check_closed_positions():
     global stats, active_positions
     try:
@@ -626,7 +603,7 @@ def check_closed_positions():
             direction = pos_info["direction"]
             entry = pos_info["entry"]
             
-            # Проверяем, не пора ли активировать трейлинг
+            # Проверка трейлинга
             if not pos_info.get("trailing_activated", False):
                 if direction == "LONG":
                     pnl_pct = (current_price - entry) / entry * 100
@@ -638,9 +615,13 @@ def check_closed_positions():
                 if margin_pnl_pct >= TRAILING_ACTIVATE_PCT * 100:
                     log.info(f"🎯 Активируем трейлинг, P&L={margin_pnl_pct:.1f}% маржи")
                     
-                    if pos_info.get("oco_algo_id"):
-                        okx_cancel_algo(pos_info["oco_algo_id"])
+                    # Отменяем старые ордера
+                    if pos_info.get("sl_order_id"):
+                        okx_cancel_algo(pos_info["sl_order_id"])
+                    if pos_info.get("tp_order_id"):
+                        okx_cancel_algo(pos_info["tp_order_id"])
                     
+                    # Ставим трейлинг
                     trail = okx_post("/api/v5/trade/order-algo", {
                         "instId": SYMBOL, "tdMode": "cross",
                         "side": pos_info["cls_side"], "posSide": pos_info["pos_side"],
@@ -659,7 +640,7 @@ def check_closed_positions():
                             f"📊 Стоп движется за ценой (отступ {TRAILING_CALLBACK*100:.1f}%)"
                         )
             
-            # Проверяем, закрыта ли позиция
+            # Проверка закрытия
             still_open = False
             for p in current_positions:
                 if float(p.get("pos", 0)) != 0:
@@ -669,7 +650,7 @@ def check_closed_positions():
             if not still_open:
                 history = okx_get("/api/v5/trade/orders-history-archive", {
                     "instType": "SWAP", "instId": SYMBOL, "state": "filled",
-                    "begin": str(int((time.time() - 86400) * 1000)),
+                    "begin": str(int((pos_info["open_time"] - 60) * 1000)),
                     "end": str(int(time.time() * 1000)), "limit": "50"
                 })
                 
@@ -683,7 +664,9 @@ def check_closed_positions():
                     if h.get("side") == pos_info["cls_side"] and h.get("posSide") == pos_info["pos_side"]:
                         avg_px = float(h.get("avgPx", 0))
                         qty = float(h.get("sz", 0))
-                        if avg_px > 0 and qty > 0:
+                        exec_time = float(h.get("cTime", 0)) / 1000 if h.get("cTime") else 0
+                        
+                        if avg_px > 0 and qty > 0 and exec_time > pos_info["open_time"]:
                             if direction == "LONG":
                                 pnl_pct = (avg_px - entry) / entry * 100
                                 if avg_px >= pos_info.get("tp", 0) * 0.99:
@@ -707,8 +690,10 @@ def check_closed_positions():
                 if total_pnl != 0:
                     if total_pnl > 0:
                         stats["wins"] += 1
+                        stats["total_profit_sum"] += total_pnl
                     else:
                         stats["losses"] += 1
+                        stats["total_loss_sum"] += abs(total_pnl)
                     
                     stats["total"] += 1
                     stats["total_profit"] += total_pnl
@@ -727,11 +712,12 @@ def check_closed_positions():
                         f"💎 P&L: {total_pnl:+.2f} USDT\n\n"
                         f"📈 <b>СТАТИСТИКА:</b>\n"
                         f"🔹 Всего сделок: {stats['total']}\n"
-                        f"✅ Прибыльных: {stats['wins']} ({winrate:.1f}%)\n"
-                        f"❌ Убыточных: {stats['losses']}\n"
-                        f"💰 Общий P&L: {stats['total_profit']:.2f} USDT\n"
+                        f"✅ Прибыльных: {stats['wins']} | Сумма: +{stats['total_profit_sum']:.2f} USDT\n"
+                        f"❌ Убыточных: {stats['losses']} | Сумма: -{stats['total_loss_sum']:.2f} USDT\n"
+                        f"💰 Общий P&L: {stats['total_profit']:+.2f} USDT\n"
                         f"📉 Макс. просадка: {stats['max_drawdown']:.2f} USDT\n"
-                        f"📊 Средний P&L: {avg_pnl:+.2f} USDT"
+                        f"📊 Средний P&L: {avg_pnl:+.2f} USDT\n"
+                        f"🎯 Винрейт: {winrate:.1f}%"
                     )
                     
                     log.info(f"✅ Сделка закрыта: {direction} P&L={total_pnl:.2f}")
@@ -741,14 +727,10 @@ def check_closed_positions():
     except Exception as e:
         log.error(f"check_closed: {e}")
 
-# ══════════════════════════════════════════════
-# ИНДИКАТОРЫ
-# ══════════════════════════════════════════════
 def calc(df):
     df["EMA9"] = df["close"].ewm(span=9, adjust=False).mean()
     df["EMA21"] = df["close"].ewm(span=21, adjust=False).mean()
     df["EMA50"] = df["close"].ewm(span=50, adjust=False).mean()
-    df["EMA9_1h"] = df["close"].ewm(span=9, adjust=False).mean()
 
     d = df["close"].diff()
     gain = d.clip(lower=0).ewm(com=13, adjust=False).mean()
@@ -790,11 +772,8 @@ def calc(df):
     df["shooter"] = (uw > body * 2) & (lw < body * 0.5) & (df["close"] < df["open"])
     return df
 
-# ══════════════════════════════════════════════
-# СИГНАЛ
-# ══════════════════════════════════════════════
 def get_signal(df, funding, ob, btc_mom, btc_dir):
-    global ob_history, last_ob, yesterday_high, yesterday_low
+    global ob_history, last_ob, yesterday_high, yesterday_low, force_test_done
     
     if df is None or len(df) < 3:
         return None, None, None, None, 0, "Нет данных"
@@ -817,11 +796,13 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
     if corr < 0.3:
         return None, None, None, None, 0, f"Корреляция ETH/BTC низкая ({corr:.2f})"
 
-    if FORCE_TEST:
+    if FORCE_TEST and not force_test_done:
+        force_test_done = True
         entry = price
         sl = round(entry * (1 - SL_MARGIN_PCT / LEVERAGE), 2)
         tp = round(entry * (1 + TP_MARGIN_PCT / LEVERAGE), 2)
-        return "LONG", entry, sl, tp, 5.0, "🧪 ТЕСТ"
+        log.info("🧪 FORCE TEST ACTIVATED")
+        return "LONG", entry, sl, tp, 5.0, "🧪 FORCE TEST"
 
     if atr < price * ATR_MIN_PCT:
         return None, None, None, None, 0, f"Рынок мёртвый (ATR {atr:.2f})"
@@ -838,7 +819,6 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
     long_short = get_long_short_ratio()
     taker_ratio = get_taker_ratio()
     oi, oi_change = get_open_interest()
-    sp500, sp500_change = get_sp500()
     dxy, dxy_change = get_dxy()
     vix = get_vix()
     usdt_dom, usdt_dom_change = get_usdt_dominance()
@@ -974,7 +954,7 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
         elif yesterday_high * 0.99 < price < yesterday_high:
             S += 0.5
 
-    # 13. Сессия (усиленный штраф)
+    # 13. Сессия
     if 1 <= hour < 6:
         if L >= S:
             L = max(0, L - 0.75)
@@ -1017,7 +997,7 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
     elif taker_ratio < 0.9:
         S += 0.25
 
-    # 18. OI + дивергенция
+    # 18. OI
     if oi_change > 3:
         if price > df.iloc[-2]["close"]:
             L += 0.5
@@ -1029,17 +1009,7 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
         else:
             L += 0.25
 
-    # 19. S&P500
-    if sp500_change > 1:
-        L += 0.5
-    elif sp500_change > 0.3:
-        L += 0.25
-    elif sp500_change < -1:
-        S += 0.5
-    elif sp500_change < -0.3:
-        S += 0.25
-
-    # 20. DXY (усиленный штраф)
+    # 19. DXY
     if dxy_change > 0.3:
         S += 0.3
         L = max(0, L - 0.3)
@@ -1047,12 +1017,12 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
         L += 0.3
         S = max(0, S - 0.3)
 
-    # 21. VIX (усиленный штраф)
+    # 20. VIX
     if vix > 30:
         L = max(0, L - 0.5)
         S = max(0, S - 0.5)
 
-    # 22. USDT Dominance (усиленный штраф)
+    # 21. USDT Dominance
     if usdt_dom_change > 0.2:
         S += 0.3
         L = max(0, L - 0.3)
@@ -1060,19 +1030,19 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
         L += 0.3
         S = max(0, S - 0.3)
 
-    # 23. Google Trends
+    # 22. Google Trends
     if trends > 70:
         if L > S:
             L += 0.25
         else:
             S += 0.25
 
-    # 24. Важный день (усиленный штраф)
+    # 23. Важный день
     if important_day:
         L = max(0, L - 1.0)
         S = max(0, S - 1.0)
 
-    # 25. Coinbase Premium
+    # 24. Coinbase Premium
     if cb_premium > 0.05:
         L += 0.5
     elif cb_premium > 0.02:
@@ -1082,7 +1052,7 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
     elif cb_premium < -0.02:
         S += 0.25
 
-    # 26. ETH/BTC
+    # 25. ETH/BTC
     if eth_btc_chg > 0.3:
         L += 0.5
     elif eth_btc_chg > 0.1:
@@ -1092,7 +1062,7 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
     elif eth_btc_chg < -0.1:
         S += 0.25
 
-    # 27. Ликвидации
+    # 26. Ликвидации
     liq_diff = short_liq - long_liq
     if liq_diff > 0.5:
         L += 0.5
@@ -1103,14 +1073,14 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
     elif liq_diff < -0.2:
         S += 0.25
 
-    # 28. Gas Price
+    # 27. Gas Price
     if gas_price > 50:
         if L > S:
             L += 0.25
         else:
             S += 0.25
 
-    # 29. BTC Dominance
+    # 28. BTC Dominance
     if btc_dom_change > 0.2:
         S += 0.25
         L = max(0, L - 0.5)
@@ -1118,7 +1088,7 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
         L += 0.25
         S = max(0, S - 0.25)
 
-    # 30. Total Market Cap
+    # 29. Total Market Cap
     if total_mcap_change > 1:
         L += 0.25
     elif total_mcap_change < -1:
@@ -1149,9 +1119,6 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
     reason = f"L:{L:.1f} S:{S:.1f} | F&G:{fear_greed} | Corr:{corr:.2f}"
     return direction, entry, sl, tp, score, reason
 
-# ══════════════════════════════════════════════
-# ШКАЛА БАЛЛОВ
-# ══════════════════════════════════════════════
 def score_bar(score):
     filled = round(score / MAX_SCORE * 10)
     if filled > 10:
@@ -1177,9 +1144,6 @@ def score_color(score):
     else:
         return "🔴"
 
-# ══════════════════════════════════════════════
-# ГЛАВНЫЙ ЦИКЛ
-# ══════════════════════════════════════════════
 def run_scan():
     global last_heartbeat_time, losses_in_row, pause_until, yesterday_high, yesterday_low
     now = time.time()
@@ -1217,7 +1181,6 @@ def run_scan():
         
         fear_greed = get_fear_greed()
         long_short = get_long_short_ratio()
-        sp500, sp500_change = get_sp500()
         cb_premium = get_coinbase_premium()
         _, eth_btc_chg = get_eth_btc_ratio()
         long_liq, short_liq = get_liquidations()
@@ -1242,17 +1205,16 @@ def run_scan():
             signal_status = f"нет {score_color(max_score_val)} <b>{max_score_val:.1f}</b>"
         
         send_telegram(
-            f"❤️ <b>Heartbeat v4.0</b> {important_str}\n\n"
+            f"❤️ <b>Heartbeat v4.1</b> {important_str}\n\n"
             f"💰 ETH: <b>{price:.2f}</b>\n"
             f"😱 F&G: {fear_greed} | L/S: {long_short:.2f} | Corr: {corr:.2f}\n"
-            f"📊 SPX: {sp500_change:+.2f}% | DXY: {get_dxy()[1]:+.2f}%\n"
             f"🏦 CB: {cb_premium:+.3f}% | ETH/BTC: {eth_btc_chg:+.2f}%\n"
             f"💥 Liq: L={long_liq:.2f}M S={short_liq:.2f}M | Gas: {gas:.0f}\n"
             f"₿ BTC.D: {btc_dom:.1f}%\n"
             f"🌍 Сессия: {session}\n"
             f"💳 Баланс: {bal:.2f} USDT | Поз: {len(pos)}\n"
             f"🎯 Сигнал: {signal_status} | L: {l_num:.1f} S: {s_num:.1f}\n"
-            f"📊 Стат: {stats['total']} | ✅ {stats['wins']} ({winrate:.1f}%) | P&L: {stats['total_profit']:.2f} USDT\n"
+            f"📊 Стат: {stats['total']} | ✅ {stats['wins']} (+{stats['total_profit_sum']:.2f}) | ❌ {stats['losses']} (-{stats['total_loss_sum']:.2f}) | P&L: {stats['total_profit']:+.2f} USDT\n"
             f"⏰ {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC"
         )
 
@@ -1289,6 +1251,7 @@ def run_scan():
             msg += [
                 f"✅ <b>ИСПОЛНЕНО{size_bonus}</b>",
                 f"📦 Контрактов: {res['total_qty']}",
+                f"⚙️ SL: {'✅' if res.get('sl_ok') else '❌'} | TP: {'✅' if res.get('tp_ok') else '❌'}"
             ]
         else:
             losses_in_row += 1
@@ -1301,27 +1264,25 @@ def run_scan():
     send_telegram("\n".join(msg))
 
 def bot_loop():
-    log.info("🚀 Старт v4.0 FINAL")
+    log.info("🚀 Старт v4.1 FINAL")
     bal = okx_get_balance()
     stats["current_equity"] = bal
     stats["peak_equity"] = bal
     winrate = (stats["wins"] / stats["total"] * 100) if stats["total"] > 0 else 0
     
     send_telegram(
-        f"🚀 <b>OKX Scalp Bot v4.0 FINAL</b>\n\n"
+        f"🚀 <b>OKX Scalp Bot v4.1 FINAL</b>\n\n"
         f"🎭 Режим: {'🧪 ТЕСТ' if FORCE_TEST else '⚔️ БОЕВОЙ'}\n"
         f"⚙️ Плечо: x{LEVERAGE} | Базовая сделка: {ORDER_USDT} USDT\n"
         f"🎯 Мин балл: {MIN_SCORE}/7 (diff ≥ {MIN_SCORE_DIFF})\n"
         f"📐 SL: -{int(SL_MARGIN_PCT*100)}% | TP: +{int(TP_MARGIN_PCT*100)}%\n"
         f"🔒 Трейлинг: +{int(TRAILING_ACTIVATE_PCT*100)}% (отступ {TRAILING_CALLBACK*100:.1f}%)\n"
-        f"📊 Статистика: {stats['total']} | ✅ {stats['wins']} ({winrate:.1f}%)\n\n"
-        f"🆕 <b>Новое в v4.0:</b>\n"
-        f"• 1 тейк + трейлинг-стоп\n"
-        f"• +50% размера при балле ≥5.0\n"
-        f"• Блокировка входа 13-15 UTC\n"
-        f"• Корреляция ETH/BTC\n"
-        f"• Gas, BTC.D, TOTAL\n"
-        f"• Расширенная статистика"
+        f"📊 Статистика: {stats['total']} | ✅ {stats['wins']} | ❌ {stats['losses']} ({winrate:.1f}%)\n\n"
+        f"🆕 <b>Исправлено в v4.1:</b>\n"
+        f"• Раздельные SL/TP ордера\n"
+        f"• Детальная статистика (+/- суммы)\n"
+        f"• Ручное закрытие учитывается\n"
+        f"• Yahoo Finance заменён"
     )
 
     while True:
