@@ -37,9 +37,9 @@ HEARTBEAT_INTERVAL = 60 * 60
 # ══════════════════════════════════════════════
 # ТЕСТОВЫЕ НАСТРОЙКИ (МНОГО СИГНАЛОВ)
 # ══════════════════════════════════════════════
-MIN_SCORE = 2.0
+MIN_SCORE = 3.5
 MAX_SCORE = 7.0
-MIN_SCORE_DIFF = 1.0
+MIN_SCORE_DIFF = 1.5
 
 SL_MARGIN_PCT = 0.60
 TP_MARGIN_PCT = 0.40
