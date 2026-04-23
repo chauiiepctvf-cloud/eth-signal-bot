@@ -63,7 +63,7 @@ DB_PASSWORD = os.environ.get("DB_PASSWORD", "i535sycpny2dn9nh")
 # HUGGING FACE
 # ══════════════════════════════════════════════
 HF_TOKEN = os.environ.get("HF_TOKEN")
-HF_MODEL_URL = "https://huggingface.co/chauiiepctvf/xgb-model/resolve/main/xgb_model.pkl"
+HF_MODEL_URL = "https://huggingface.co/Alexeyadik/xgb-model/resolve/main/xgb_model.pkl"
 
 # ══════════════════════════════════════════════
 # TWELVE DATA (DXY/VIX)
