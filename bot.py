@@ -151,14 +151,21 @@ def update_equity(pnl):
 
 active_positions = {}
 
-def load_active_positions():
-    global active_positions
+def load_xgb_model():
+    global xgb_model
     try:
-        with open("active_positions.json", "r") as f:
-            active_positions = json.load(f)
-        log.info(f"📋 Загружено {len(active_positions)} позиций")
-    except:
-        log.info("📋 Нет сохранённых позиций")
+        r = requests.get(HF_MODEL_URL, timeout=30)
+        if r.status_code == 200:
+            with open("xgb_model.pkl", "wb") as f:
+                f.write(r.content)
+            xgb_model = joblib.load("xgb_model.pkl")
+            log.info("🤖 XGBoost модель загружена")
+            return True
+        else:
+            log.warning(f"⚠️ Модель не найдена (статус {r.status_code})")
+    except Exception as e:
+        log.warning(f"⚠️ Модель не загружена: {e}")
+    return False
 
 def save_active_positions():
     try:
@@ -901,7 +908,7 @@ def check_closed_positions(metrics):
                     save_stats()
                     
                     # Сохраняем в БД
-                    save_trade_to_db(direction, 0, 0, 0, metrics, result)
+                    save_trade_to_db(pos_info["direction"], pos_info.get("score", score), pos_info.get("L", 0), pos_info.get("S", 0), metrics, result)
                     
                     winrate = (stats["wins"] / stats["total"] * 100) if stats["total"] > 0 else 0
                     emoji = "✅" if total_pnl > 0 else "❌"
@@ -1405,8 +1412,8 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
                 ml_bonus = 0.5
             elif prob < 0.4:
                 ml_bonus = -0.5
-        except:
-            pass
+        except Exception as e:
+            log.warning(f"XGBoost predict error: {e}")
     
     if ml_bonus > 0:
         if L > S:
