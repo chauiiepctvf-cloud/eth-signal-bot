@@ -35,11 +35,11 @@ SCAN_INTERVAL = 3 * 60
 HEARTBEAT_INTERVAL = 60 * 60
 
 # ══════════════════════════════════════════════
-# ТЕСТОВЫЕ НАСТРОЙКИ (МНОГО СИГНАЛОВ)
+# ТЕСТОВЫЕ НАСТРОЙКИ 
 # ══════════════════════════════════════════════
-MIN_SCORE = 3.5
+MIN_SCORE = 4.0
 MAX_SCORE = 7.0
-MIN_SCORE_DIFF = 1.5
+MIN_SCORE_DIFF = 1.8
 
 SL_MARGIN_PCT = 0.60
 TP_MARGIN_PCT = 0.40
