@@ -4,3 +4,6 @@ numpy
 python-telegram-bot
 flask
 scikit-learn
+psycopg2-binary
+xgboost
+joblib
