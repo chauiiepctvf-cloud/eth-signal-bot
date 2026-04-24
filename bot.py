@@ -1,12 +1,13 @@
 """
-OKX Scalp Bot v5.4 FINAL"""
 OKX Scalp Bot v5.4 FINAL
 - Градуированная система весов (3 уровня)
 - Система самообучения (GradientBoosting, каждые 20 сделок)
 - Крупные сделки (aggTrades Binance)
-- Тейк +50% маржи, Стоп -50% маржи, Плечо 50, Маржа 20 USDT
-- ВСЕ ошибки исправлены: calc, _ts, pd.Series
+- Тейк +50 процентов маржи, Стоп -50 процентов маржи, Плечо 50, Маржа 20 USDT
+- ВСЕ ошибки исправлены, calc работает, баллы ненулевые
 """
+import os, time, logging, threading, hashlib, hmac, base64, json
+import requests, pandas as pd, numpy as np
 import os, time, logging, threading, hashlib, hmac, base64, json
 import requests, pandas as pd, numpy as np
 from datetime import datetime, timezone
