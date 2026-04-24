@@ -35,8 +35,8 @@ SCAN_INTERVAL = 3 * 60
 HEARTBEAT_INTERVAL = 60 * 60
 
 # ── СИСТЕМА БАЛЛОВ ─────────────────────────────────
-BASE_MIN_SCORE = 5.5
-MIN_SCORE = 5.5
+BASE_MIN_SCORE = 6.5
+MIN_SCORE = 6.5
 MIN_SCORE_DIFF = 2.0
 MAX_SCORE = 13.0
 
