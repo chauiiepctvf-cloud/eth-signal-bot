@@ -289,9 +289,10 @@ def okx_place_order(direction, entry, sl, tp):
     active_positions[order_id] = {
 
     active_positions[order_id] = {
-        "direction": direction, "entry": entry, "sl": sl, "tp": tp,
-        "total_qty": total_qty, "pos_side": pos_side, "cls_side": cls_side,
-        "open_time": time.time()
+    "direction": direction, "entry": entry, "sl": sl, "tp": tp,
+    "total_qty": total_qty, "pos_side": pos_side, "cls_side": cls_side,
+    "open_time": time.time(), "tp_ok": tp_ok, "sl_ok": sl_ok
+}
     }
     save_active_positions()
     return {"ok": True, "orderId": order_id, "total_qty": total_qty, "tp_ok": tp_ok, "sl_ok": sl_ok}
