@@ -11,14 +11,6 @@ import requests, pandas as pd, numpy as np
 from datetime import datetime, timezone
 from flask import Flask
 from sklearn.ensemble import IsolationForest
-
-# --- ИСПРАВЛЕНО: Добавлен вызов Flask(__name__) ---
-app = Flask(__name__)
-
-# Настройка логирования
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-log = logging.getLogger(__name__)
-
 # ══════════════════════════════════════════════════════
 # НАСТРОЙКИ
 # ══════════════════════════════════════════════════════
@@ -37,23 +29,6 @@ LEVERAGE = 15
 ORDER_USDT = 20
 SCAN_INTERVAL = 3 * 60
 HEARTBEAT_INTERVAL = 60 * 60
-
-# --- ИСПРАВЛЕНО: Добавлены отсутствующие константы ---
-STATS_FILE = "stats.json"
-ATR_MIN_PCT = 0.005
-FORCE_TEST = False
-force_test_done = False
-SL_MARGIN_PCT = 0.05 # 5% от маржи
-TP_MARGIN_PCT = 0.15 # 15% от маржи
-NIGHT_HOURS = (22, 6) # с 22 до 6 утра
-RED_NEWS_DROP = -0.01 # 1% падение
-RED_NEWS_VOL = 1.5
-RED_NEWS_BLOCK = 1800 # 30 минут блокировки
-MAX_LOSSES = 3
-PAUSE_LOSSES = 1800
-last_heartbeat_time = 0
-# --- КОНЕЦ ИСПРАВЛЕНИЙ ---
-
 # ── СИСТЕМА БАЛЛОВ ─────────────────────────────────
 # Градуированная: ЯДРО(макс 7) + СРЕДНИЕ(макс 4) + ВСПОМОГАТЕЛЬНЫЕ(макс 2)
 # Итого макс ~13, порог входа 5.5, разница L-S >= 2.0
@@ -61,10 +36,29 @@ BASE_MIN_SCORE = 5.5
 MIN_SCORE = 5.5
 MIN_SCORE_DIFF = 2.0
 MAX_SCORE = 13.0
+# ── КОНСТАНТЫ ─────────────────────────────────────
+STATS_FILE = "stats.json"
+ATR_MIN_PCT = 0.0005  # ИСПРАВЛЕНО: было 0.005, рынок всегда мёртвый
+FORCE_TEST = False
+force_test_done = False
+SL_MARGIN_PCT = 0.05
+TP_MARGIN_PCT = 0.15
+NIGHT_HOURS = (22, 6)
+RED_NEWS_DROP = -0.01
+RED_NEWS_VOL = 1.5
+RED_NEWS_BLOCK = 1800
+MAX_LOSSES = 3
+PAUSE_LOSSES = 1800
+last_heartbeat_time = 0
+
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+log = logging.getLogger(__name__)
 
 # ── ГЛОБАЛЬНЫЙ КЭШ ─────────────────────────────────
-# --- ИСПРАВЛЕНО: Кэш должен быть определен до его использования ---
 cache = {
+    "fear_greed": {"value": 50, "ts": 0},
+    "long_short": {"value": 1.0, "ts": 0},
     "taker_ratio": {"value": 1.0, "ts": 0},
     "open_interest": {"value": 0, "change": 0, "ts": 0},
     "dxy": {"value": 100, "change": 0, "ts": 0},
@@ -80,15 +74,13 @@ cache = {
     "news_sentiment": {"value": 0.0, "ts": 0},
     "stablecoin": {"value": 0, "change": 0, "ts": 0},
     "4h_trend": {"diff": 0.0, "bull": False, "ts": 0},
-    "fear_greed": {"value": 50, "ts": 0},
-    "long_short": {"value": 1.0, "ts": 0},
 }
 ob_history = []
 last_ob = 0.0
 red_news_until = 0
 pause_until = 0
 losses_in_row = 0
-# --- КОНЕЦ ГЛОБАЛЬНОГО КЭША ---
+yesterday_high, yesterday_low = 0, 0
 
 stats = {
     "total": 0, "wins": 0, "losses": 0,
@@ -96,7 +88,6 @@ stats = {
     "total_loss_sum": 0.0, "max_drawdown": 0.0,
     "peak_equity": 0.0, "current_equity": 0.0
 }
-
 def load_stats():
     global stats
     try:
@@ -104,17 +95,15 @@ def load_stats():
             loaded = json.load(f)
             for k in stats:
                 if k in loaded: stats[k] = loaded[k]
-            log.info(f"Статистика загружена: {stats['total']} сделок")
+        log.info(f"Статистика загружена: {stats['total']} сделок")
     except:
         log.info("Нет статистики, начинаем с нуля")
-
 def save_stats():
     try:
         with open(STATS_FILE, "w") as f:
             json.dump(stats, f)
     except Exception as e:
         log.error(f"Ошибка сохранения: {e}")
-
 def update_equity(pnl):
     stats["current_equity"] += pnl
     if stats["current_equity"] > stats["peak_equity"]:
@@ -122,9 +111,7 @@ def update_equity(pnl):
     dd = stats["peak_equity"] - stats["current_equity"]
     if dd > stats["max_drawdown"]:
         stats["max_drawdown"] = dd
-
 active_positions = {}
-
 def load_active_positions():
     global active_positions
     try:
@@ -133,19 +120,15 @@ def load_active_positions():
         log.info(f"Загружено {len(active_positions)} позиций")
     except:
         log.info("Нет сохранённых позиций")
-
 def save_active_positions():
     try:
         with open("active_positions.json", "w") as f:
             json.dump(active_positions, f)
     except Exception as e:
         log.error(f"Ошибка сохранения позиций: {e}")
-
 load_stats()
 load_active_positions()
-
 # TELEGRAM
-# --- ИСПРАВЛЕНО: def -> полная функция ---
 def send_telegram(text: str):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return
@@ -155,32 +138,24 @@ def send_telegram(text: str):
             json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
             timeout=15
         )
-        log.info(f"TG OK {r.status_code}" if r.status_code == 200 else f"TG FAIL: {r.text}")
+        log.info(f"TG OK" if r.status_code == 200 else f"TG FAIL: {r.text}")
     except Exception as e:
         log.error(f"TG: {e}")
-# --- КОНЕЦ ИСПРАВЛЕНИЙ ---
-
 # OKX API
-# --- ИСПРАВЛЕНО: def -> полная функция ---
 def _ts():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
 def _sign(ts, method, path, body=""):
     if not OKX_API_KEY or not OKX_SECRET or not OKX_PASSPHRASE:
-         log.error("OKX API ключи не заданы.")
-         return ""
-    try:
-        prehash = str(ts) + str.upper(method) + path + str(body)
-        mac = hmac.new(OKX_SECRET.encode(), prehash.encode(), hashlib.sha256)
-        return base64.b64encode(mac.digest()).decode()
-    except Exception as e:
-        log.error(f"Sign error: {e}")
         return ""
+    prehash = str(ts) + str.upper(method) + path + str(body)
+    mac = hmac.new(OKX_SECRET.encode(), prehash.encode(), hashlib.sha256)
+    return base64.b64encode(mac.digest()).decode()
 
 def okx_get(path, params=None):
     if not OKX_API_KEY: return {}
     ts = _ts()
-    sign = _sign(ts, "GET", path + (f"?{requests.compat.urlencode(params)}" if params else ""))
+    query = f"?{requests.compat.urlencode(params)}" if params else ""
+    sign = _sign(ts, "GET", path + query)
     headers = {
         "OK-ACCESS-KEY": OKX_API_KEY,
         "OK-ACCESS-SIGN": sign,
@@ -190,7 +165,7 @@ def okx_get(path, params=None):
     }
     headers.update(OKX_DEMO_HEADER)
     try:
-        r = requests.get(f"{OKX_BASE}{path}", params=params, headers=headers, timeout=15)
+        r = requests.get(f"{OKX_BASE}{path}{query}", headers=headers, timeout=15)
         return r.json()
     except Exception as e:
         log.error(f"OKX GET error: {e}")
@@ -228,8 +203,8 @@ def okx_get_balance():
             for dt in d.get("details", []):
                 if dt.get("ccy") == "USDT":
                     return float(dt.get("eq", 0))
-    except Exception as e:
-        log.error(f"Balance error: {e}")
+    except:
+        pass
     return 0.0
 
 def okx_get_positions():
@@ -256,7 +231,6 @@ def okx_place_order(direction, entry, sl, tp):
     cls_side = "sell" if direction == "LONG" else "buy"
 
     hour = datetime.now(timezone.utc).hour
-    # --- ИСПРАВЛЕНО: синтаксис multiplier ---
     multiplier = 0.5 if NIGHT_HOURS[0] <= hour < NIGHT_HOURS[1] else 1.0
     effective = ORDER_USDT * multiplier
     total_qty = max(1, round(effective * LEVERAGE / entry / 0.01))
@@ -283,9 +257,8 @@ def okx_place_order(direction, entry, sl, tp):
     }
     save_active_positions()
     return {"ok": True, "orderId": order_id, "total_qty": total_qty}
-# --- КОНЕЦ OKX API ---
 
-# --- ИСПРАВЛЕНО: функции get_klines, get_funding, get_ob ---
+# ── РЫНОЧНЫЕ ДАННЫЕ ──
 def get_klines(sym, interval, limit=150):
     try:
         data = requests.get(
@@ -341,7 +314,6 @@ def get_yesterday_levels():
     except:
         pass
     return 0, 0
-yesterday_high, yesterday_low = get_yesterday_levels()
 
 def get_fear_greed():
     now = time.time()
@@ -408,7 +380,6 @@ def get_dxy():
             return v, chg
     except:
         pass
-    # Фолбэк через Yahoo Finance
     try:
         r = requests.get(
             "https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB?interval=1d&range=5d",
@@ -425,7 +396,8 @@ def get_dxy():
 
 def get_vix():
     now = time.time()
-    if now - cache["vix"]["ts"] < 3600: return cache["vix"]["value"]
+    if now - cache["vix"]["ts"] < 3600:
+        return cache["vix"]["value"]
     try:
         if TWELVE_API_KEY:
             v = float(requests.get(
@@ -434,10 +406,10 @@ def get_vix():
             ).json().get("close", 20))
             cache["vix"] = {"value": v, "ts": now}
             return v
-        # Фолбэк Yahoo
         r = requests.get(
             "https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX?interval=1d&range=5d",
-            headers={"User-Agent": "Mozilla/5.0"}, timeout=10
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10
         )
         v = r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
         cache["vix"] = {"value": v, "ts": now}
@@ -450,15 +422,13 @@ def get_usdt_dominance():
     if now - cache["usdt_dominance"]["ts"] < 600:
         return cache["usdt_dominance"]["value"], cache["usdt_dominance"]["change"]
     try:
-        # --- ИСПРАВЛЕНО: Парсинг JSON для CoinGecko ---
         data = requests.get("https://api.coingecko.com/api/v3/global", timeout=10).json()
         dom = float(data["data"]["market_cap_percentage"]["usdt"])
         prev = cache["usdt_dominance"]["value"]
         chg = dom - prev if prev > 0 else 0
         cache["usdt_dominance"] = {"value": dom, "change": chg, "ts": now}
         return dom, chg
-    except Exception as e:
-        log.error(f"USDT dominance error: {e}")
+    except:
         return 5.0, 0
 
 def get_btc_dominance():
@@ -466,20 +436,16 @@ def get_btc_dominance():
     if now - cache["btc_dominance"]["ts"] < 600:
         return cache["btc_dominance"]["value"], cache["btc_dominance"]["change"]
     try:
-        # --- ИСПРАВЛЕНО: Парсинг JSON для CoinGecko ---
         data = requests.get("https://api.coingecko.com/api/v3/global", timeout=10).json()
         dom = float(data["data"]["market_cap_percentage"]["btc"])
         prev = cache["btc_dominance"]["value"]
         chg = dom - prev if prev > 0 else 0
         cache["btc_dominance"] = {"value": dom, "change": chg, "ts": now}
         return dom, chg
-    except Exception as e:
-        log.error(f"BTC dominance error: {e}")
+    except:
         return 50, 0
 
 def get_coinbase_premium():
-    # --- ИСПРАВЛЕНО: Заглушка, если не используется т.к. сложный расчет ---
-    # Оригинальная реализация была непонятна в PDF
     return 0.0
 
 def get_eth_btc_ratio():
@@ -487,12 +453,8 @@ def get_eth_btc_ratio():
     if now - cache["eth_btc_ratio"]["ts"] < 300:
         return cache["eth_btc_ratio"]["value"], cache["eth_btc_ratio"]["change"]
     try:
-        eth_price = float(requests.get(
-            "https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT"
-        ).json()["price"])
-        btc_price = float(requests.get(
-            "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
-        ).json()["price"])
+        eth_price = float(requests.get("https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT").json()["price"])
+        btc_price = float(requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT").json()["price"])
         ratio = eth_price / btc_price if btc_price > 0 else 0.0
         prev = cache["eth_btc_ratio"]["value"]
         chg = ratio - prev if prev > 0 else 0.0
@@ -502,7 +464,6 @@ def get_eth_btc_ratio():
         return 0.0, 0.0
 
 def get_liquidations():
-     # --- ИСПРАВЛЕНО: Заглушка ---
     return 0.0, 0.0
 
 def get_funding_avg():
@@ -551,15 +512,12 @@ def get_gas_price():
         return 20
 
 def get_news_sentiment():
-    # --- ИСПРАВЛЕНО: Заглушка ---
     return 0.0
 
 def get_stablecoin_supply():
-    # --- ИСПРАВЛЕНО: Заглушка ---
     return 0.0, 0.0
 
 def is_important_economic_day():
-    # --- ИСПРАВЛЕНО: Заглушка ---
     return False
 
 def get_4h_trend():
@@ -602,7 +560,7 @@ def get_eth_btc_correlation():
     except:
         return 1.0
 
-# INDIKATOPH
+# ИНДИКАТОРЫ
 def calc(df):
     # EMA
     df["EMA9"] = df["close"].ewm(span=9, adjust=False).mean()
@@ -637,7 +595,7 @@ def calc(df):
     # CVD
     df["CVD"] = (df["taker_buy_base"] - (df["volume"] - df["taker_buy_base"]))
     df["CVD_up"] = df["CVD"] > df["CVD"].shift(3)
-    # Объем
+    # Объём
     df["vol_ma"] = df["volume"].rolling(20).mean()
     df["vol_spike"] = df["volume"] > df["vol_ma"] * 1.3
     df["vol_extreme"] = df["volume"] > df["vol_ma"] * 3.0
@@ -669,38 +627,30 @@ def calc(df):
 def get_signal(df, funding, ob, btc_mom, btc_dir):
     global ob_history, last_ob, yesterday_high, yesterday_low
     global force_test_done, red_news_until, MIN_SCORE
-
     if df is None or len(df) < 10:
-        return None, None, None, None, 0, "Нет данных"
-
+        return None, None, None, None, 0, "Нет данных", 0, 0, {}
     row = df.iloc[-1]
     price = row["close"]
     rsi = row["RSI"]
     atr = row["ATR"]
-    # --- ИСПРАВЛЕНО: Обработка NaN ADX ---
     adx = row["ADX"] if not np.isnan(row.get("ADX", float("nan"))) else 20
 
-    # — Фильтры входа
+    # Фильтры входа
     if atr < price * ATR_MIN_PCT:
-        return None, None, None, None, 0, "Рынок мёртвый"
-
+        return None, None, None, None, 0, "Рынок мёртвый", 0, 0, {}
     now = time.time()
     hour = datetime.now(timezone.utc).hour
-
     # Свежесть свечи
     sec = (datetime.now(timezone.utc) - row["candle_time"].replace(tzinfo=timezone.utc)).total_seconds()
     if sec < 60:
-        return None, None, None, None, 0, f"Свеча свежая ({int(sec)}c)"
-
+        return None, None, None, None, 0, f"Свеча свежая ({int(sec)}с)", 0, 0, {}
     # Открытие США (13-15 UTC) — высокая волатильность, пропускаем
     if 13 <= hour < 15:
-        return None, None, None, None, 0, "Открытие США — пропуск"
-
+        return None, None, None, None, 0, "Открытие США — пропуск", 0, 0, {}
     # Низкая корреляция ETH/BTC — аномалия
     corr = get_eth_btc_correlation()
     if corr < 0.3:
-        return None, None, None, None, 0, f"Корреляция низкая ({corr:.2f})"
-
+        return None, None, None, None, 0, f"Корреляция низкая ({corr:.2f})", 0, 0, {}
     # Красные новости
     if red_news_until > now:
         prev_price = df.iloc[-2]["close"]
@@ -708,16 +658,14 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
             row["volume"] > df.iloc[-2]["volume"] * RED_NEWS_VOL):
             red_news_until = now + RED_NEWS_BLOCK
             log.warning("Красные новости!")
-
     # FORCE TEST
     if FORCE_TEST and not force_test_done:
         force_test_done = True
         entry = price
         sl = round(entry * (1 - SL_MARGIN_PCT / LEVERAGE), 2)
         tp = round(entry * (1 + TP_MARGIN_PCT / LEVERAGE), 2)
-        return "LONG", entry, sl, tp, 5.0, "FORCE TEST"
-
-    # — Стакан (динамика)
+        return "LONG", entry, sl, tp, 5.0, "FORCE TEST", 5.0, 0, {}
+    # Стакан (динамика)
     ob_history.append(ob)
     if len(ob_history) > 6: ob_history.pop(0)
     ob_rising = len(ob_history) >= 3 and ob_history[-1] > ob_history[-3] + 2
@@ -725,7 +673,7 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
     ob_delta = ob - last_ob if last_ob != 0 else 0
     last_ob = ob
 
-    # — Внешние метрики
+    # Внешние метрики
     fear_greed = get_fear_greed()
     long_short = get_long_short_ratio()
     taker_ratio = get_taker_ratio()
@@ -752,8 +700,7 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
         elif price < df.iloc[-5]["close"] and row["OBV"] > row["OBV_ma"]: obv_div = -1
 
     L = S = 0.0
-
-    # --- ЯДРО – вес 1.0 (макс ~7 баллов) ---
+    # ЯДРО – вес 1.0 (макс ~7 баллов)
     # 1. EMA тренд (вес 1.0 / 0.5)
     if row["EMA9"] > row["EMA21"] > row["EMA50"]: L += 1.0
     elif row["EMA9"] < row["EMA21"] < row["EMA50"]: S += 1.0
@@ -789,8 +736,7 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
     if adx < 20:
         L = max(0, L - 0.5)
         S = max(0, S - 0.5)
-
-    # --- СРЕДНИЕ – вес 0.5 (макс ~4 балла) ---
+    # СРЕДНИЕ – вес 0.5 (макс ~4 балла)
     # 8. Fear & Greed (contrarian)
     if fear_greed < 25: L += 0.5
     elif fear_greed < 40: L += 0.25
@@ -804,8 +750,6 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
     # 10. Taker ratio
     if taker_ratio > 1.3: L += 0.5
     elif taker_ratio > 1.1: L += 0.25
-    elif taker_ratio < 0.7: S += 0.5
-    elif taker_ratio < 0.9: S += 0.25
     # 11. Coinbase Premium (институциональ)
     if cb_premium > 0.05: L += 0.5
     elif cb_premium > 0.02: L += 0.25
@@ -830,8 +774,7 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
     # 15. VWAP
     if price < row["VWAP"]: L += 0.5
     else: S += 0.5
-
-    # --- ВСПОМОГАТЕЛЬНЫЕ — вес 0.25 (макс ~2 балла) ---
+    # ВСПОМОГАТЕЛЬНЫЕ — вес 0.25 (макс ~2 балла)
     # 16. BTC моментум
     if btc_mom > 0.2: L += 0.25; S = max(0, S - 0.25)
     elif btc_mom < -0.2: S += 0.25; L = max(0, L - 0.25)
@@ -839,23 +782,24 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
     if dxy_change > 0.3: S += 0.25; L = max(0, L - 0.25)
     elif dxy_change < -0.3: L += 0.25; S = max(0, S - 0.25)
     # 18. VIX (высокий страх = риск-офф)
-    if vix > 30: L = max(0, L - 0.25); S = max(0, S - 0.25)
+    if vix > 30:
+        L = max(0, L - 0.25); S = max(0, S - 0.25)
     # 19. Ликвидации
     liq_diff = short_liqu - long_liqu
     if liq_diff > 0.5: L += 0.25
     elif liq_diff < -0.5: S += 0.25
-    # 20. BTC доминанс
+    # 20. BTC доминанс (рост BTC.D = деньги уходят из альтов)
     if btc_dom_change > 0.2: S += 0.25; L = max(0, L - 0.25)
     elif btc_dom_change < -0.2: L += 0.25; S = max(0, S - 0.25)
     # 21. Фандинг средний
     if funding_avg > 0.005: S += 0.25
     elif funding_avg < -0.005: L += 0.25
-    # 22. USDT доминанс
+    # 22. USDT доминанс (рост = уход в кэш)
     if usdt_dom_change > 0.2: S += 0.25
     elif usdt_dom_change < -0.2: L += 0.25
-    # 23. Стейблкоин приток
+    # 23. Стейблкоин приток (деньги готовы войти)
     if stable_chg > 0.5: L += 0.25
-    # 24. Газ Ethereum
+    # 24. Газ Ethereum (высокий = активность)
     if gas_price > 50:
         if L > S: L += 0.25
         else: S += 0.25
@@ -875,39 +819,22 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
     # 29. ОВ дельта
     if ob_delta > 3: L += 0.25
     elif ob_delta < -3: S += 0.25
-    # 30. Киты
-    if whales_detected:
-        if L > S: L += 0.25
-        else: S += 0.25
 
-    # --- ML Бонус ---
-    ml_metrics = {
-        "fear_greed": fear_greed, "long_short": long_short, "taker_ratio": taker_ratio,
-        "oi_change": oi_change, "cb_premium": cb_premium, "eth_btc_chg": eth_btc_chg,
-        "liq_diff": liq_diff, "funding_avg": funding_avg, "adx": adx, "rsi": rsi,
-        "bb_pct": bp, "ob": ob, "btc_mom": btc_mom, "large_trades": 0,
-        "hour": hour, "weekday": datetime.now(timezone.utc).weekday()
-    }
-    ml_bonus = get_ml_bonus(L, S, ml_metrics)
-
-    # Применяем ML бонус к большей стороне
-    if ml_bonus > 0:
-        if L >= S: L += ml_bonus
-        else: S += ml_bonus
-    elif ml_bonus < 0:
-        if L > S: L += ml_bonus
-        else: S += ml_bonus
-
-    # --- Итоговое решение ---
+    # Итоговое решение
     L = round(L, 2)
     S = round(S, 2)
     diff = L - S
 
-    # --- ИСПРАВЛЕНО: Создана reason_str ---
+    ml_metrics = {
+        "fear_greed": fear_greed, "long_short": long_short, "taker_ratio": taker_ratio,
+        "oi_change": oi_change, "cb_premium": cb_premium, "eth_btc_chg": eth_btc_chg,
+        "liq_diff": liq_diff, "funding_avg": funding_avg, "adx": adx, "rsi": rsi,
+        "bb_pct": bp, "ob": ob, "btc_mom": btc_mom,
+        "hour": hour, "weekday": datetime.now(timezone.utc).weekday()
+    }
+
     reason_str = f"L:{L} S:{S} D:{diff:.1f}"
-    if ml_bonus != 0: reason_str += f" ML:{ml_bonus:+.2f}"
-    if force_test_done: reason_str = "FORCE TEST"
-    elif red_news_until > now: reason_str += " RED_NEWS"
+    score = max(L, S)
 
     if diff >= MIN_SCORE_DIFF and L >= MIN_SCORE:
         entry = price
@@ -920,17 +847,16 @@ def get_signal(df, funding, ob, btc_mom, btc_dir):
         tp = round(entry * (1 - TP_MARGIN_PCT / LEVERAGE), 2)
         return "SHORT", entry, sl, tp, S, reason_str, L, S, ml_metrics
 
-    return None, None, None, None, max(L, S), reason_str, L, S, ml_metrics
+    return None, None, None, None, score, reason_str, L, S, ml_metrics
 
+# ПРОВЕРКА ЗАКРЫТЫХ ПОЗИЦИЙ
 def check_closed_positions():
-    global active_positions, losses_in_row
+    global active_positions, losses_in_row, MIN_SCORE
     if not active_positions:
         return
     try:
-        # --- ИСПРАВЛЕНО: получение истории ордеров ---
         pos_ids = list(active_positions.keys())
         if not pos_ids: return
-
         r = okx_get("/api/v5/trade/orders-history", {"instType": "SWAP", "instId": SYMBOL, "limit": 100})
         history = r.get("data", [])
         if not history: return
@@ -945,7 +871,7 @@ def check_closed_positions():
             total_pnl = 0.0
             close_reason = ""
 
-            for h in history["data"]:
+            for h in history:
                 if h.get("side") == pos["cls_side"] and h.get("posSide") == pos["pos_side"]:
                     avg_px = float(h.get("avgPx", 0))
                     qty = float(h.get("sz", 0))
@@ -955,68 +881,67 @@ def check_closed_positions():
                         if direction == "LONG":
                             pnl_pct = (avg_px - entry) / entry * 100
                             if avg_px >= pos.get("tp", 0) * 0.99:
-                                close_reason = f"ТЕЙК (+{int(TP_MARGIN_PCT*100)}%)"
+                                close_reason = f"🎯 ТЕЙК (+{int(TP_MARGIN_PCT*100)}%)"
                             elif avg_px <= pos.get("sl", 0) * 1.01:
-                                close_reason = f"СТОП (-{int(SL_MARGIN_PCT*100)}%)"
+                                close_reason = f"🛑 СТОП (-{int(SL_MARGIN_PCT*100)}%)"
                         else:
                             pnl_pct = (entry - avg_px) / entry * 100
                             if avg_px <= pos.get("tp", 0) * 1.01:
-                                close_reason = f"ТЕЙК (+{int(TP_MARGIN_PCT*100)}%)"
+                                close_reason = f"🎯 ТЕЙК (+{int(TP_MARGIN_PCT*100)}%)"
                             elif avg_px >= pos.get("sl", 0) * 0.99:
-                                close_reason = f"СТОП (-{int(SL_MARGIN_PCT*100)}%)"
-                        pos_val = ORDER_USDT * LEVERAGE * (qty / pos.get("total_qty", total_qty))
+                                close_reason = f"🛑 СТОП (-{int(SL_MARGIN_PCT*100)}%)"
+                        pos_val = ORDER_USDT * LEVERAGE * (qty / pos.get("total_qty", qty))
                         total_pnl += pnl_pct / 100 * pos_val
 
-            if is_closed:
-                # --- ИСПРАВЛЕНО: Обновление статистики ---
-                if total_pnl != 0:
-                    is_win = total_pnl > 0
-                    if is_win:
-                        stats["wins"] += 1
-                        stats["total_profit_sum"] += total_pnl
-                        if MIN_SCORE != BASE_MIN_SCORE:
-                            MIN_SCORE = BASE_MIN_SCORE
-                            log.info(f"MIN_SCORE → {BASE_MIN_SCORE}")
-                        losses_in_row = 0
-                    else:
-                        stats["losses"] += 1
-                        stats["total_loss_sum"] += abs(total_pnl)
-                        losses_in_row += 1
-                        if losses_in_row >= 3 and MIN_SCORE < BASE_MIN_SCORE + 1.0:
-                            MIN_SCORE += 0.5
-                            log.info(f"3 убытка − MIN_SCORE → {MIN_SCORE}")
-                            send_telegram(f"3 убытка подряд\nMIN_SCORE → {MIN_SCORE}")
-                    stats["total"] += 1
-                    stats["total_profit"] += total_pnl
-                    update_equity(total_pnl)
-                    save_stats()
+            if total_pnl != 0:
+                is_win = total_pnl > 0
+                if is_win:
+                    stats["wins"] += 1
+                    stats["total_profit_sum"] += total_pnl
+                    if MIN_SCORE != BASE_MIN_SCORE:
+                        MIN_SCORE = BASE_MIN_SCORE
+                        log.info(f"MIN_SCORE → {BASE_MIN_SCORE}")
+                    losses_in_row = 0
+                else:
+                    stats["losses"] += 1
+                    stats["total_loss_sum"] += abs(total_pnl)
+                    losses_in_row += 1
+                    if losses_in_row >= 3 and MIN_SCORE < BASE_MIN_SCORE + 1.0:
+                        MIN_SCORE += 0.5
+                        log.info(f"3 убытка − MIN_SCORE → {MIN_SCORE}")
+                        send_telegram(f"3 убытка подряд\nMIN_SCORE → {MIN_SCORE}")
+                stats["total"] += 1
+                stats["total_profit"] += total_pnl
+                update_equity(total_pnl)
+                save_stats()
 
-                    winrate = (stats["wins"] / stats["total"] * 100) if stats["total"] > 0 else 0
-                    avg_pnl = stats["total_profit"] / stats["total"] if stats["total"] > 0 else 0
-                    emoji = "✅" if is_win else "🔴"
-                    send_telegram(
-                        f"{emoji} <b>СДЕЛКА ЗАКРЫТА</b>\n\n"
-                        f"Направление: {direction}\n"
-                        f"Вход: {entry:.2f}\n"
-                        f"Причина: {close_reason}\n"
-                        f"P&L: {total_pnl:+.2f} USDT\n\n"
-                        f"<b>СТАТИСТИКА:</b>\n"
-                        f"Всего: {stats['total']}\n"
-                        f"Прибыльных: {stats['wins']} (+{stats['total_profit_sum']:.2f})\n"
-                        f"Убыточных: {stats['losses']} (-{stats['total_loss_sum']:.2f})\n"
-                        f"P&L итого: {stats['total_profit']:+.2f} USDT\n"
-                        f"Макс просадка: {stats['max_drawdown']:.2f} USDT\n"
-                        f"Средний P&L: {avg_pnl:+.2f} USDT\n"
-                        f"Винрейт: {winrate:.1f}%\n"
-                        f"MIN_SCORE: {MIN_SCORE}"
-                    )
-                    update_signal_result(order_id, "TP" if is_win else "SL", total_pnl)
-                    maybe_retrain()
-                    del active_positions[order_id]
-                    save_active_positions()
+                winrate = (stats["wins"] / stats["total"] * 100) if stats["total"] > 0 else 0
+                avg_pnl = stats["total_profit"] / stats["total"] if stats["total"] > 0 else 0
+                emoji = "✅" if is_win else "🔴"
+                send_telegram(
+                    f"{emoji} <b>СДЕЛКА ЗАКРЫТА</b>\n\n"
+                    f"📈 Направление: {direction}\n"
+                    f"💰 Вход: {entry:.2f}\n"
+                    f"📝 Причина: {close_reason}\n"
+                    f"💵 P&L: {total_pnl:+.2f} USDT\n\n"
+                    f"<b>📊 СТАТИСТИКА:</b>\n"
+                    f"🔹 Всего: {stats['total']}\n"
+                    f"✅ Прибыльных: {stats['wins']} (+{stats['total_profit_sum']:.2f})\n"
+                    f"🔴 Убыточных: {stats['losses']} (-{stats['total_loss_sum']:.2f})\n"
+                    f"💰 P&L итого: {stats['total_profit']:+.2f} USDT\n"
+                    f"📉 Макс просадка: {stats['max_drawdown']:.2f} USDT\n"
+                    f"📊 Средний P&L: {avg_pnl:+.2f} USDT\n"
+                    f"🎯 Винрейт: {winrate:.1f}%\n"
+                    f"⚙️ MIN_SCORE: {MIN_SCORE}"
+                )
+                update_signal_result(order_id, "TP" if is_win else "SL", total_pnl)
+                maybe_retrain()
+                del active_positions[order_id]
+                save_active_positions()
     except Exception as e:
         log.error(f"check_closed: {e}")
 
+# ШКАЛА БАЛЛОВ
 def score_bar(score):
     filled = min(10, round(score / MAX_SCORE * 10))
     bar = "🟩" * filled + "⬜" * (10 - filled)
@@ -1032,12 +957,13 @@ def score_color(score):
     elif score >= 4: return "🟠"
     return "🔴"
 
+# ОСНОВНОЙ ЦИКЛ
 def run_scan():
-    global last_heartbeat_time, pause_until, yesterday_high, yesterday_low, losses_in_row
+    global last_heartbeat_time, pause_until, yesterday_high, yesterday_low
 
     now = time.time()
     if now < pause_until:
-        log.info(f"Пауза {int((pause_until - now)/60)} мин")
+        log.info(f"⏸️ Пауза {int((pause_until- now)/60)} мин")
         return
 
     check_closed_positions()
@@ -1047,7 +973,7 @@ def run_scan():
 
     df = get_klines(SYMBOL_BN, "5m", 150)
     if df is None:
-        send_telegram("Ошибка свечей")
+        send_telegram("❌ Ошибка свечей")
         return
 
     calc(df)
@@ -1061,10 +987,9 @@ def run_scan():
     if len(sig) == 9:
         direction, entry, sl, tp, score, reason, _L, _S, _ml_metrics = sig
     else:
-        direction, entry, sl, tp, score, reason = sig
-        _L, _S, _ml_metrics = 0, 0, {}
+        direction, entry, sl, tp, score, reason, _L, _S, _ml_metrics = *sig, 0, 0, {}
 
-    log.info(f"ETH:{price:.2f} | {direction or 'Нет'} {score:.1f}/{MAX_SCORE} | {reason}")
+    log.info(f"ETH:{price:.2f} | {direction or 'нет'} {score:.1f}/{MAX_SCORE} | {reason}")
 
     # Heartbeat
     if now - last_heartbeat_time >= HEARTBEAT_INTERVAL:
@@ -1072,7 +997,7 @@ def run_scan():
         bal = okx_get_balance()
         pos = okx_get_positions()
         hour = datetime.now(timezone.utc).hour
-        session = "🌙" if 1 <= hour < 6 else "☀️" if hour < 13 else "🌤️"
+        session = "🌙 Ночь" if 1<=hour<6 else ("🌅 Утро" if hour<13 else "🌤️ День")
         fear_greed = get_fear_greed()
         long_short = get_long_short_ratio()
         cb_premium = get_coinbase_premium()
@@ -1082,41 +1007,34 @@ def run_scan():
         btc_dom, _ = get_btc_dominance()
         important_day = is_important_economic_day()
 
-        # --- ИСПРАВЛЕНО: Парсинг L и S из reason ---
         l_num = s_num = 0.0
         if "L:" in reason:
             try:
-                parts = reason.split("L:")[1].split(" ")
-                l_num = float(parts[0])
-                s_parts = reason.split("S:")[1].split(" ")
-                s_num = float(s_parts[0])
+                l_num = float(reason.split("L:")[1].split(" ")[0])
+                s_num = float(reason.split("S:")[1].split(" ")[0])
             except: pass
 
         sig_status = (
             f"{direction} {score_color(score)} <b>{score:.1f}</b>"
-            if direction else
-            f"НЕТ {score_color(max(l_num,s_num))} <b>{max(l_num,s_num):.1f}</b>"
+            if direction else f"НЕТ {score_color(max(l_num,s_num))} <b>{max(l_num,s_num):.1f}</b>"
         )
 
         winrate = (stats["wins"] / stats["total"] * 100) if stats["total"] > 0 else 0
         send_telegram(
-            f"<b>Heartbeat v5.0</b> {'❗️ВАЖНЫЙ ДЕНЬ' if important_day else ''}\n\n"
-            f"ETH: <b>{price:.2f}</b> ATR:{atr_val:.2f}\n"
-            f"F&G:{fear_greed} | L/S:{long_short:.2f}\n"
-            f"CB:{cb_premium:.3f} | ETH/BTC:{eth_btc_chg:.2f}\n"
-            f"Liq: L={long_liqu:.2f}M S={short_liqu:.2f}M\n"
-            f"Gas:{gas:.0f} | BTC.D:{btc_dom:.1f}\n"
-            f"{session} СЕССИЯ | Balance:{bal:.2f} USDT | Pos:{len(pos)}\n"
-            f"Сигнал: {sig_status} L:{l_num:.1f} S:{s_num:.1f}\n"
-            f"MIN_SCORE:{MIN_SCORE} (База:{BASE_MIN_SCORE})\n"
-            f"{stats['total']} сд | {stats['wins']}W ({winrate:.1f}%) | P&L: {stats['total_profit']:.2f}\n"
-            f"{datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC"
+            f"<b>❤️ Heartbeat v5.0</b>{' ⚠️' if important_day else ''}\n\n"
+            f"💰 <b>ETH: {price:.2f}</b> ATR:{atr_val:.2f}\n"
+            f"😱 F&G:{fear_greed} | L/S:{long_short:.2f}\n"
+            f"🌍 <b>{session}</b> | 💳 Баланс:{bal:.2f} USDT | Поз:{len(pos)}\n"
+            f"🎯 Сигнал:{sig_status} | L:{l_num:.1f} S:{s_num:.1f}\n"
+            f"⚙️ MIN_SCORE:{MIN_SCORE} (База:{BASE_MIN_SCORE})\n"
+            f"📊 {stats['total']} сд | ✅ {stats['wins']} ({winrate:.1f}%) | P&L:{stats['total_profit']:+.2f}\n"
+            f"⏰ {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC"
         )
 
     if direction is None:
         return
 
-    mode = "ТЕСТ" if FORCE_TEST else "БОЕВОЙ"
+    mode = "🧪 ТЕСТ" if FORCE_TEST else "⚔️ БОЕВОЙ"
     msg = [
         f"<b>[{mode}]</b>",
         f"{'🟢' if direction=='LONG' else '🔴'} <b>SCALP {direction}</b>",
@@ -1132,6 +1050,7 @@ def run_scan():
     ]
 
     has_pos = len(okx_get_positions()) > 0
+
     if not OKX_API_KEY:
         msg.append("🔑 OKX_API_KEY не задан")
     elif has_pos:
@@ -1140,12 +1059,9 @@ def run_scan():
         res = okx_place_order(direction, entry, sl, tp)
         if res["ok"]:
             losses_in_row = 0
-            sl_s = "✅" if res.get("sl_ok") else "❌"
-            tp_s = "✅" if res.get("tp_ok") else "❌"
             msg += [
                 f"✅ <b>ИСПОЛНЕНО НА OKX</b>",
                 f"📦 Контрактов: {res['total_qty']}",
-                f"🛑 SL: {sl_s} | 🎯 TP: {tp_s}",
                 f"🔖 OrderID: {res['orderId']}",
             ]
             save_signal_to_history({
@@ -1173,27 +1089,27 @@ def run_scan():
     send_telegram("\n".join(msg))
 
 def bot_loop():
-    log.info("Старт v5.0")
+    log.info("🚀 Старт v5.0")
     bal = okx_get_balance()
     stats["current_equity"] = bal
     stats["peak_equity"] = bal
 
-    winrate = (stats["wins"] / stats["total"] * 100) if stats["total"] > 0 else 0
+    winrate = (stats["wins"]/stats["total"]*100) if stats["total"] > 0 else 0
     send_telegram(
         f"<b>🚀 OKX Scalp Bot v5.0</b>\n\n"
-        f"Плечо: x{LEVERAGE} | Сделка: {ORDER_USDT} USDT\n"
-        f"MIN_SCORE: {BASE_MIN_SCORE}/{MAX_SCORE} (diff ≥ {MIN_SCORE_DIFF})\n"
-        f"SL: -{int(SL_MARGIN_PCT*100)}% | TP: +{int(TP_MARGIN_PCT*100)}% R/R: {TP_MARGIN_PCT/SL_MARGIN_PCT:.1f}:1\n"
-        f"Баланс: {bal:.2f} USDT\n"
-        f"Статистика: {stats['total']} | {stats['wins']}W ({winrate:.1f}%)\n\n"
+        f"📐 Плечо: x{LEVERAGE} | Сделка: {ORDER_USDT} USDT\n"
+        f"⚙️ MIN_SCORE: {BASE_MIN_SCORE}/{MAX_SCORE} (diff ≥ {MIN_SCORE_DIFF})\n"
+        f"🛑 SL: -{int(SL_MARGIN_PCT*100)}% | 🎯 TP: +{int(TP_MARGIN_PCT*100)}% R/R: {TP_MARGIN_PCT/SL_MARGIN_PCT:.1f}:1\n"
+        f"💳 Баланс: {bal:.2f} USDT\n"
+        f"📊 Статистика: {stats['total']} | {stats['wins']} ({winrate:.1f}%)\n\n"
         f"<b>Система v5.0:</b>\n"
-        f"- Градуированные веса (Ядро/Средние/Вспомог)\n"
-        f"- ADX фильтр слабых трендов\n"
-        f"- Автосужение MIN_SCORE\n"
-        f"- Корреляция ETH/BTC\n"
-        f"- IsolationForest (киты)\n"
-        f"- Ночной множитель позиции *0.5\n"
-        f"- Защита от красных новостей"
+        f"🔹 Градуированные веса (Ядро/Средние/Вспомог)\n"
+        f"🔹 ADX фильтр слабых трендов\n"
+        f"🔹 Автосужение MIN_SCORE\n"
+        f"🔹 Корреляция ETH/BTC\n"
+        f"🔹 IsolationForest (киты)\n"
+        f"🔹 Ночной множитель позиции *0.5\n"
+        f"🔹 Защита от красных новостей"
     )
 
     while True:
@@ -1204,8 +1120,30 @@ def bot_loop():
             send_telegram(f"❌ Ошибка: {e}")
         time.sleep(SCAN_INTERVAL)
 
+# КРУПНЫЕ СДЕЛКИ (без ключа, Binance aggTrades)
+def get_large_trades_signal():
+    try:
+        now_ms = int(time.time() * 1000)
+        ago_ms = now_ms - 2 * 60 * 1000
+        data = requests.get(
+            f"https://fapi.binance.com/fapi/v1/aggTrades?symbol={SYMBOL_BN}&startTime={ago_ms}&endTime={now_ms}&limit=500",
+            timeout=8
+        ).json()
+        buy_vol = sell_vol = 0.0
+        LARGE = 50.0
+        for t in data:
+            qty = float(t.get("q", 0))
+            if qty < LARGE: continue
+            if not t.get("m", True): buy_vol += qty
+            else: sell_vol += qty
+        diff = buy_vol - sell_vol
+        log.info(f"Крупные сделки: buy={buy_vol:.0f} sell={sell_vol:.0f} diff={diff:.0f}")
+        return diff
+    except Exception as e:
+        log.error(f"large_trades: {e}")
+        return 0.0
 
-# --- БЛОК ML МОДЕЛИ (ИСПРАВЛЕНО) ---
+# СИСТЕМА ОБУЧЕНИЯ НА СВОИХ СИГНАЛАХ
 SIGNALS_FILE = "signals_history.json"
 ML_MODEL_FILE = "scalp_model.pkl"
 signals_history = []
@@ -1300,7 +1238,7 @@ def train_model():
             f"<b>🧠 ML модель обновлена</b>\n\n"
             f"Примеров: {len(X)}\n"
             f"Винрейт в данных: {win_rate:.1%}\n"
-            + (f"CV accuracy: {scores.mean():.2f}" if len(X) >= 50 else f"<b>🧠 ML модель обновлена</b>\n\nПримеров: {len(X)}")
+            + (f"CV accuracy: {scores.mean():.2f}" if len(X) >= 50 else "")
         )
         return True
     except Exception as e:
@@ -1336,8 +1274,6 @@ def maybe_retrain():
         _trades_since_last_train = 0
         threading.Thread(target=train_model, daemon=True).start()
         log.info("Запущено переобучение модели в фоне")
-# --- КОНЕЦ ML ---
-
 
 if __name__ == "__main__":
     threading.Thread(target=bot_loop, daemon=True).start()
