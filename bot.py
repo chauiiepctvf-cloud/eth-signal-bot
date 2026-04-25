@@ -50,8 +50,10 @@ RED_NEWS_BLOCK = 1800
 MAX_LOSSES = 3
 PAUSE_LOSSES = 1800
 last_heartbeat_time = 0
-
 app = Flask(__name__)
+@app.route('/')
+def home():
+    return "OK", 200
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
