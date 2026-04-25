@@ -38,7 +38,7 @@ MIN_SCORE_DIFF = 2.0
 MAX_SCORE = 13.0
 # ── КОНСТАНТЫ ─────────────────────────────────────
 STATS_FILE = "stats.json"
-ATR_MIN_PCT = 0.0005  # ИСПРАВЛЕНО: было 0.005, рынок всегда мёртвый
+ATR_MIN_PCT = 0.0003  # 0.03% от цены (~0.69 при ETH=2315)
 FORCE_TEST = False
 force_test_done = False
 SL_MARGIN_PCT = 0.05
@@ -1007,12 +1007,7 @@ def run_scan():
         btc_dom, _ = get_btc_dominance()
         important_day = is_important_economic_day()
 
-        l_num = s_num = 0.0
-        if "L:" in reason:
-            try:
-                l_num = float(reason.split("L:")[1].split(" ")[0])
-                s_num = float(reason.split("S:")[1].split(" ")[0])
-            except: pass
+        l_num, s_num = _L, _S
 
         sig_status = (
             f"{direction} {score_color(score)} <b>{score:.1f}</b>"
