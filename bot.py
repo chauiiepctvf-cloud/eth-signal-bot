@@ -250,7 +250,43 @@ def okx_place_order(direction, entry, sl, tp):
         return {"ok": False, "step": "open", "msg": msg}
 
     order_id = r["data"][0].get("ordId", "")
-    log.info(f"Открыта ordId={order_id}")
+    log.info(f"Открыта позиция ordId={order_id}")
+
+    # Выставляем TP на биржу
+    tp_ok = False
+    try:
+        tp_r = okx_post("/api/v5/trade/order-algo", {
+            "instId": SYMBOL, "tdMode": "cross",
+            "side": cls_side, "posSide": pos_side,
+            "ordType": "conditional", "sz": str(total_qty),
+            "tpTriggerPx": str(tp), "tpOrdPx": str(tp)
+        })
+        tp_ok = tp_r.get("code") == "0"
+        if tp_ok:
+            log.info(f"TP выставлен на {tp}")
+        else:
+            log.error(f"TP ошибка: {tp_r.get('msg')}")
+    except Exception as e:
+        log.error(f"TP исключение: {e}")
+
+    # Выставляем SL на биржу
+    sl_ok = False
+    try:
+        sl_r = okx_post("/api/v5/trade/order-algo", {
+            "instId": SYMBOL, "tdMode": "cross",
+            "side": cls_side, "posSide": pos_side,
+            "ordType": "conditional", "sz": str(total_qty),
+            "slTriggerPx": str(sl), "slOrdPx": str(sl)
+        })
+        sl_ok = sl_r.get("code") == "0"
+        if sl_ok:
+            log.info(f"SL выставлен на {sl}")
+        else:
+            log.error(f"SL ошибка: {sl_r.get('msg')}")
+    except Exception as e:
+        log.error(f"SL исключение: {e}")
+
+    active_positions[order_id] = {
 
     active_positions[order_id] = {
         "direction": direction, "entry": entry, "sl": sl, "tp": tp,
@@ -258,7 +294,7 @@ def okx_place_order(direction, entry, sl, tp):
         "open_time": time.time()
     }
     save_active_positions()
-    return {"ok": True, "orderId": order_id, "total_qty": total_qty}
+    return {"ok": True, "orderId": order_id, "total_qty": total_qty, "tp_ok": tp_ok, "sl_ok": sl_ok}
 
 # ── РЫНОЧНЫЕ ДАННЫЕ ──
 def get_klines(sym, interval, limit=150):
@@ -1108,6 +1144,26 @@ def bot_loop():
         f"🔹 Ночной множитель позиции *0.5\n"
         f"🔹 Защита от красных новостей"
     )
+
+    # Восстановление позиций с OKX после редеплоя
+    try:
+        existing = okx_get_positions()
+        if existing:
+            log.info(f"Восстановлено {len(existing)} позиций с OKX")
+            for p in existing:
+                side = "LONG" if p.get("posSide") == "long" else "SHORT"
+                active_positions[f"rec_{int(time.time())}"] = {
+                    "direction": side,
+                    "entry": float(p.get("avgPx", 0)),
+                    "sl": 0, "tp": 0,
+                    "total_qty": abs(int(float(p.get("pos", 0)))),
+                    "pos_side": p.get("posSide"),
+                    "cls_side": "sell" if side == "LONG" else "buy",
+                    "open_time": time.time() - 3600
+                }
+            save_active_positions()
+    except Exception as e:
+        log.error(f"Ошибка восстановления: {e}")
 
     while True:
         try:
