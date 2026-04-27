@@ -41,8 +41,8 @@ STATS_FILE = "stats.json"
 ATR_MIN_PCT = 0.0003  # 0.03% от цены (~0.69 при ETH=2315)
 FORCE_TEST = False
 force_test_done = False
-SL_MARGIN_PCT = 0.05
-TP_MARGIN_PCT = 0.15
+SL_MARGIN_PCT = 0.30
+TP_MARGIN_PCT = 0.25
 NIGHT_HOURS = (22, 6)
 RED_NEWS_DROP = -0.01
 RED_NEWS_VOL = 1.5
