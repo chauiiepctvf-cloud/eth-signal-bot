@@ -174,7 +174,7 @@ stats = {
     "total_profit_sum": 0.0, "total_loss_sum": 0.0,
     "max_drawdown": 0.0, "peak_equity": 0.0, "current_equity": 0.0,
     "best_trade": 0.0, "worst_trade": 0.0,
-    "ml_trains_count": 0, "ml_last_train_ts": 0.0,
+    "ml_train_count": 0, "ml_last_train_ts": 0.0,
     "ml_last_accuracy": 0.0, "ml_samples_at_last_train": 0,
 }
 
@@ -1535,7 +1535,7 @@ def _train_model():
         imp_str = " | ".join([f"{n}:{v*100:.0f}%" for n, v in imp])
 
         wr = sum(y) / len(y)
-        stats["ml_trains_count"] += 1
+        stats["ml_train_count"] += 1
         stats["ml_last_train_ts"] = now
         stats["ml_last_accuracy"] = cv_acc
         stats["ml_samples_at_last_train"] = len(X)
@@ -1545,7 +1545,7 @@ def _train_model():
             f"Примеров: {len(X)} | WR в выборке: {wr:.1%}\n"
             f"CV accuracy: {cv_acc:.1%}\n"
             f"Топ признаков: {imp_str}\n"
-            f"Всего обучений: {stats['ml_trains_count']}"
+            f"Всего обучений: {stats['ml_train_count']}"
         )
         storage_save_async()
         return True
@@ -1714,9 +1714,9 @@ def _send_heartbeat(price, atr_val, L, S, score, direction):
     )
 
     ml_info = ""
-    if stats["ml_trains_count"] > 0:
+    if stats["ml_train_count"] > 0:
         last_train = datetime.fromtimestamp(stats["ml_last_train_ts"]).strftime("%d.%m %H:%M")
-        ml_info = (f"\n🧠 ML: {stats['ml_trains_count']} обуч | "
+        ml_info = (f"\n🧠 ML: {stats['ml_train_count']} обуч | "
                    f"acc:{stats['ml_last_accuracy']:.1%} | "
                    f"{stats['ml_samples_at_last_train']} примеров | {last_train}")
 
@@ -1762,7 +1762,7 @@ def _send_daily_report():
         f"  Просадка: {stats['max_drawdown']:.2f}\n"
         f"  Баланс: {bal:.2f} USDT\n\n"
         f"🧠 <b>ML:</b>\n"
-        f"  Обучений: {stats['ml_trains_count']}\n"
+        f"  Обучений: {stats['ml_train_count']}\n"
         f"  Последнее: {last_train_str}\n"
         f"  Accuracy: {stats['ml_last_accuracy']:.1%}\n"
         f"  Сделок до след.: {ML_RETRAIN_EVERY - ml_train_counter}"
