@@ -1,41 +1,47 @@
 """
-OKX Scalp Bot v6.0 (ETH-USDT-SWAP, 5m)
-=========================================================
-Главные изменения vs v5.1:
-
-ХРАНИЛИЩЕ (исправление потери данных при деплое):
-  • JSONBin.io как основное хранилище — переживает редеплой
-  • Локальные файлы как backup (не основной источник)
-  • Авто-миграция локальных файлов в JSONBin при старте
-
-ТОРГОВЛЯ (по запросу: без трейлинга / без переноса / без частичного):
-  • Плечо снижено x50 → x20 (безопаснее для скальпа)
-  • SL = 1.5 × ATR (динамический, не фиксированный %)
-  • TP = 3.0 × ATR (RR = 2.0 — нужен WR ≥ 33% для безубытка)
-  • Один TP, один SL — больше ничего
-
-ИСПРАВЛЕННЫЕ БАГИ:
-  • check_closed_positions: PnL теперь привязан к конкретному order_id
-  • Старые алго-ордера отменяются при закрытии (раньше висели)
-  • VWAP с дневным reset (раньше копился непрерывно)
-  • detect_whales кэшируется 60с (раньше обучал IsolationForest каждый скан)
-  • ml_train_counter сбрасывается ТОЛЬКО при успешном обучении
-  • Telegram теперь в отдельных потоках — не блокирует основной цикл
-  • Watchdog: алерт если скан застрял >10 мин
-
-ML УЛУЧШЕНИЯ:
-  • sample_weight с экспоненциальным затуханием (старые сделки меньше влияют)
-  • Переобучение каждые 10 закрытий (было 20)
-  • Feature importance в Telegram после каждого обучения
-  • Cross-validation accuracy в логах
-  • Модель не сохраняется на диск — обучается заново на старте из истории
-
-МЕТРИКИ И БАЛЛЫ:
-  • Веса CVD и vol_dir снижены до 0.75 (было 1.0+0.5 — частичное дублирование)
-  • Спред-фильтр (>0.05% — пропуск)
-  • Расширенная статистика: best/worst trade, profit factor, equity
-  • Ежедневный отчёт в 23:00 UTC
-"""
+# OKX Scalp Bot v6.2 (ETH-USDT-SWAP, multi-timeframe)
+# =========================================================
+# Главные изменения vs v5.1:
+#
+# ХРАНИЛИЩЕ (исправление потери данных при деплое):
+#   * JSONBin.io как основное хранилище -- переживает редеплой
+#   * Локальные файлы как backup (не основной источник)
+#   * Авто-миграция локальных файлов в JSONBin при старте
+#
+# ТОРГОВЛЯ (по запросу: без трейлинга / без переноса / без частичного):
+#   * Плечо снижено x50 → x20 (безопаснее для скальпа)
+#   * SL = 1.5 x ATR (динамический, не фиксированный %)
+#   * TP = 3.0 x ATR (RR = 2.0 -- нужен WR ≥ 33% для безубытка)
+#   * Один TP, один SL -- больше ничего
+#
+# ИСПРАВЛЕННЫЕ БАГИ:
+#   * check_closed_positions: PnL теперь привязан к конкретному order_id
+#   * Старые алго-ордера отменяются при закрытии (раньше висели)
+#   * VWAP с дневным reset (раньше копился непрерывно)
+#   * detect_whales кэшируется 60с (раньше обучал IsolationForest каждый скан)
+#   * ml_train_counter сбрасывается ТОЛЬКО при успешном обучении
+#   * Telegram теперь в отдельных потоках -- не блокирует основной цикл
+#   * Watchdog: алерт если скан застрял >10 мин
+#
+# ML УЛУЧШЕНИЯ:
+#   * sample_weight с экспоненциальным затуханием (старые сделки меньше влияют)
+#   * Переобучение каждые 10 закрытий (было 20)
+#   * Feature importance в Telegram после каждого обучения
+#   * Cross-validation accuracy в логах
+#   * Модель не сохраняется на диск -- обучается заново на старте из истории
+#
+# МЕТРИКИ И БАЛЛЫ:
+#   * Веса CVD и vol_dir снижены до 0.75 (было 1.0+0.5 -- частичное дублирование)
+#   * Спред-фильтр (>0.05% -- пропуск)
+#   * Расширенная статистика: best/worst trade, profit factor, equity
+#   * Ежедневный отчёт в 23:00 UTC
+#
+# v6.1 ДОБАВЛЕНО:
+# * Кулдаун после TP (15 мин) и SL (30 мин)
+# * Анти-чейзинг: блок входа при движении >0.5% от точки выхода
+# * Перегрев RSI/BB: блок входа на экстремумах
+# * Ждём отката после TP в той же стороне
+# * Состояние кулдауна сохраняется в JSONBin (переживает рестарт)
 
 import os
 import time
@@ -52,9 +58,9 @@ import pandas as pd
 import numpy as np
 from flask import Flask
 
-# ════════════════════════════════════════════════════════
+# ========================================================
 # КОНФИГ
-# ════════════════════════════════════════════════════════
+# ========================================================
 TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID         = os.environ.get("CHAT_ID")
 OKX_API_KEY     = os.environ.get("OKX_API_KEY")
@@ -74,8 +80,8 @@ BTC_SYMBOL      = "BTCUSDT"
 # Торговля (статические TP/SL, без трейлинга/перемещения)
 LEVERAGE        = 20            # снижено с 50
 ORDER_USDT      = 20
-SL_ATR_MULT     = 1.5           # SL = 1.5 × ATR
-TP_ATR_MULT     = 3.0           # TP = 3.0 × ATR (RR=2.0)
+SL_ATR_MULT     = 1.5           # SL = 1.5 x ATR
+TP_ATR_MULT     = 3.0           # TP = 3.0 x ATR (RR=2.0)
 SL_PCT_MIN      = 0.0025        # минимум 0.25% от цены
 SL_PCT_MAX      = 0.012         # максимум 1.2% от цены
 TP_PCT_MAX      = 0.025         # максимум 2.5% от цены
@@ -102,6 +108,16 @@ MAX_LOSSES      = 3
 PAUSE_LOSSES    = 1800
 ETH_BTC_CORR_MIN= 0.3
 
+# Кулдаун после закрытия сделки (анти-чейзинг)
+COOLDOWN_AFTER_TP   = 15 * 60   # 15 мин после TP -- не входим
+COOLDOWN_AFTER_SL   = 30 * 60   # 30 мин после SL -- дольше остываем
+ANTI_CHASE_PCT      = 0.005     # если цена ушла >0.5% от точки выхода -- не лезем в ту же сторону
+ANTI_CHASE_WINDOW   = 30 * 60   # окно проверки 30 мин
+RSI_OVERHEAT_LONG   = 75        # выше -- не лонгуем
+RSI_OVERHEAT_SHORT  = 25        # ниже -- не шортим
+BB_OVERHEAT_LONG    = 0.9       # BB% выше -- не лонгуем
+BB_OVERHEAT_SHORT   = 0.1       # BB% ниже -- не шортим
+
 # ML
 ML_RETRAIN_EVERY= 10            # было 20
 ML_MIN_SAMPLES  = 30
@@ -109,17 +125,17 @@ ML_DECAY_DAYS   = 7
 
 FORCE_TEST      = False
 
-# ════════════════════════════════════════════════════════
+# ========================================================
 # ЛОГИРОВАНИЕ
-# ════════════════════════════════════════════════════════
+# ========================================================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# ════════════════════════════════════════════════════════
+# ========================================================
 # JSONBIN STORAGE
-# ════════════════════════════════════════════════════════
+# ========================================================
 JSONBIN_URL = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}" if JSONBIN_BIN_ID else None
 _save_lock = threading.Lock()
 
@@ -127,7 +143,7 @@ _save_lock = threading.Lock()
 def jsonbin_load():
     """Читает весь record из JSONBin. Возвращает dict или {}."""
     if not JSONBIN_KEY or not JSONBIN_URL:
-        log.warning("⚠️ JSONBin не настроен — данные потеряются при деплое")
+        log.warning("⚠️ JSONBin не настроен -- данные потеряются при деплое")
         return {}
     try:
         r = requests.get(
@@ -165,16 +181,16 @@ def jsonbin_save(data: dict) -> bool:
     return False
 
 
-# ════════════════════════════════════════════════════════
+# ========================================================
 # СОСТОЯНИЕ
-# ════════════════════════════════════════════════════════
+# ========================================================
 stats = {
     "total": 0, "wins": 0, "losses": 0,
     "total_profit": 0.0,
     "total_profit_sum": 0.0, "total_loss_sum": 0.0,
     "max_drawdown": 0.0, "peak_equity": 0.0, "current_equity": 0.0,
     "best_trade": 0.0, "worst_trade": 0.0,
-    "ml_train_count": 0, "ml_last_train_ts": 0.0,
+    "ml_trains_count": 0, "ml_last_train_ts": 0.0,
     "ml_last_accuracy": 0.0, "ml_samples_at_last_train": 0,
 }
 
@@ -190,6 +206,12 @@ pause_until      = 0.0
 losses_in_row    = 0
 yesterday_high   = 0.0
 yesterday_low    = 0.0
+
+# Кулдаун-трекеры
+last_close_ts        = 0.0      # время последнего закрытия
+last_close_result    = None     # "TP" или "SL"
+last_close_direction = None     # "LONG" или "SHORT"
+last_close_price     = 0.0      # цена закрытия
 force_test_done  = False
 scalp_model      = None
 ml_train_counter = 0
@@ -216,18 +238,18 @@ cache = {
 }
 
 
-# ════════════════════════════════════════════════════════
+# ========================================================
 # ХРАНИЛИЩЕ: ЗАГРУЗКА И СОХРАНЕНИЕ
-# ════════════════════════════════════════════════════════
+# ========================================================
 def storage_load_all():
     """Грузит данные. Приоритет: JSONBin > локальные файлы (миграция)."""
     global stats, active_positions, signals_history, MIN_SCORE
 
     data = jsonbin_load()
 
-    # Если JSONBin пуст — пробуем локальные файлы (одноразовая миграция)
+    # Если JSONBin пуст -- пробуем локальные файлы (одноразовая миграция)
     if not data:
-        log.info("JSONBin пустой — пытаюсь мигрировать локальные файлы")
+        log.info("JSONBin пустой -- пытаюсь мигрировать локальные файлы")
         migrated = {}
         for fname, key in [
             ("signals_history.json", "signals_history"),
@@ -269,6 +291,12 @@ def storage_load_all():
     if isinstance(ms, (int, float)):
         MIN_SCORE = float(ms)
 
+    global last_close_ts, last_close_result, last_close_direction, last_close_price
+    last_close_ts        = data.get("last_close_ts", 0.0) or 0.0
+    last_close_result    = data.get("last_close_result")
+    last_close_direction = data.get("last_close_direction")
+    last_close_price     = data.get("last_close_price", 0.0) or 0.0
+
     log.info(
         f"Загружено: signals={len(signals_history)} "
         f"trades={stats['total']} "
@@ -305,9 +333,9 @@ def storage_save_async():
     threading.Thread(target=storage_save_all, daemon=True).start()
 
 
-# ════════════════════════════════════════════════════════
+# ========================================================
 # TELEGRAM (асинхронно)
-# ════════════════════════════════════════════════════════
+# ========================================================
 def _tg_send(text: str):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return
@@ -325,9 +353,9 @@ def send_telegram(text: str):
     threading.Thread(target=_tg_send, args=(text,), daemon=True).start()
 
 
-# ════════════════════════════════════════════════════════
+# ========================================================
 # OKX API
-# ════════════════════════════════════════════════════════
+# ========================================================
 def _ts():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
@@ -521,13 +549,12 @@ def okx_place_order(direction, entry, sl, tp):
     }
 
 
-# ════════════════════════════════════════════════════════
-# ПРОВЕРКА ЗАКРЫТЫХ ПОЗИЦИЙ — фикс багов из v5.1
-# ════════════════════════════════════════════════════════
+# ========================================================
+# ПРОВЕРКА ЗАКРЫТЫХ ПОЗИЦИЙ -- фикс багов из v5.1
+# ========================================================
 def check_closed_positions():
     """Проверяет какие из активных позиций закрылись.
-    Привязка PnL к конкретному order_id (баг v5.1 исправлен).
-    Отменяет оставшийся алго-ордер при закрытии."""
+    + Time-stop: принудительное закрытие позиций висящих > MAX_HOLD_HOURS."""
     global losses_in_row, MIN_SCORE
 
     if not active_positions:
@@ -540,16 +567,42 @@ def check_closed_positions():
             if abs(float(p.get("pos", 0))) > 0:
                 open_sides.add(p.get("posSide"))
 
+        now = time.time()
+
         for order_id in list(active_positions.keys()):
             pos = active_positions.get(order_id)
             if not pos:
+                continue
+
+            # Time-stop: позиция висит дольше лимита -> закрываем по рынку
+            age_hrs = (now - pos.get("open_time", now)) / 3600
+            if (pos.get("pos_side") in open_sides
+                and age_hrs > MAX_HOLD_HOURS):
+                log.warning(f"Time-stop: {order_id} висит {age_hrs:.1f}ч > {MAX_HOLD_HOURS}ч -- закрываю")
+                send_telegram(
+                    f"⏱ <b>TIME-STOP</b>\n"
+                    f"Позиция {pos['direction']} висит {age_hrs:.1f}ч\n"
+                    f"Принудительное закрытие по рынку"
+                )
+                # Отменяем алго и закрываем рынком
+                okx_cancel_algo(pos.get("sl_algo_id"))
+                okx_cancel_algo(pos.get("tp_algo_id"))
+                okx_post("/api/v5/trade/order", {
+                    "instId":  SYMBOL,
+                    "tdMode":  "cross",
+                    "side":    pos["cls_side"],
+                    "posSide": pos["pos_side"],
+                    "ordType": "market",
+                    "sz":      str(pos["total_qty"]),
+                })
+                # На следующем скане позиция уже закроется и обработается
                 continue
 
             # Позиция всё ещё открыта?
             if pos.get("pos_side") in open_sides:
                 continue
 
-            # Закрылась — обрабатываем
+            # Закрылась -- обрабатываем
             _handle_position_close(order_id, pos)
 
     except Exception as e:
@@ -580,8 +633,8 @@ def _handle_position_close(order_id, pos):
     ]
 
     if not close_fills:
-        # Возможно ещё не зафиксировались — отложим
-        log.info(f"Позиция {order_id} закрыта но fills не найдены — жду")
+        # Возможно ещё не зафиксировались -- отложим
+        log.info(f"Позиция {order_id} закрыта но fills не найдены -- жду")
         return
 
     # Взвешенная средняя цена закрытия
@@ -622,6 +675,13 @@ def _handle_position_close(order_id, pos):
     is_win = pnl_usdt > 0
     _update_stats(pnl_usdt, is_win)
     _update_signal_result(order_id, "TP" if is_win else "SL", pnl_usdt)
+
+    # Сохраняем для кулдауна и анти-чейзинга
+    global last_close_ts, last_close_result, last_close_direction, last_close_price
+    last_close_ts        = time.time()
+    last_close_result    = "TP" if is_win else "SL"
+    last_close_direction = direction
+    last_close_price     = avg_close
 
     # Адаптация MIN_SCORE
     global losses_in_row, MIN_SCORE
@@ -689,9 +749,9 @@ def _update_stats(pnl, is_win):
         stats["max_drawdown"] = dd
 
 
-# ════════════════════════════════════════════════════════
+# ========================================================
 # ДАННЫЕ С БИРЖ
-# ════════════════════════════════════════════════════════
+# ========================================================
 def get_klines(sym, interval, limit=150):
     try:
         url = f"https://api.binance.com/api/v3/klines?symbol={sym}&interval={interval}&limit={limit}"
@@ -764,7 +824,7 @@ def get_yesterday_levels():
     return 0.0, 0.0
 
 
-# ── Внешние метрики (с кэшем) ──────────────────────────
+# -- Внешние метрики (с кэшем) --------------------------
 def get_fear_greed():
     now = time.time()
     if now - cache["fear_greed"]["ts"] < 3600:
@@ -1028,9 +1088,9 @@ def get_eth_btc_correlation():
         return 1.0
 
 
-# ════════════════════════════════════════════════════════
-# ИНДИКАТОРЫ (с дневным VWAP reset — фикс v5.1)
-# ════════════════════════════════════════════════════════
+# ========================================================
+# ИНДИКАТОРЫ (с дневным VWAP reset -- фикс v5.1)
+# ========================================================
 def calc(df):
     global last_vwap_reset_day
 
@@ -1116,9 +1176,9 @@ def calc(df):
     return df
 
 
-# ════════════════════════════════════════════════════════
+# ========================================================
 # СИГНАЛ
-# ════════════════════════════════════════════════════════
+# ========================================================
 def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
     global ob_history, last_ob, yesterday_high, yesterday_low
     global force_test_done, red_news_until
@@ -1138,6 +1198,16 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
 
     if spread_pct > SPREAD_MAX_PCT:
         return None, None, None, None, 0, f"Спред {spread_pct*100:.3f}%", 0, 0, {}
+
+    # ADX_MIN -- без тренда не торгуем (зависит от таймфрейма)
+    if adx < ADX_MIN:
+        return None, None, None, None, 0, f"ADX={adx:.0f} < {ADX_MIN}", 0, 0, {}
+
+    # Окно торговли (для 5m отрезаем мёртвую азию)
+    if TRADING_HOURS is not None:
+        h_now = datetime.now(timezone.utc).hour
+        if not (TRADING_HOURS[0] <= h_now < TRADING_HOURS[1]):
+            return None, None, None, None, 0, f"Вне окна {TRADING_HOURS[0]}-{TRADING_HOURS[1]} UTC", 0, 0, {}
 
     now = time.time()
     hour = datetime.now(timezone.utc).hour
@@ -1193,7 +1263,7 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
 
     L = S = 0.0
 
-    # ═════ ЯДРО ═════════════════════════════════════════
+    # ===== ЯДРО =========================================
     # 1. EMA 5m
     if   row["EMA9"] > row["EMA21"] > row["EMA50"]: L += 1.0
     elif row["EMA9"] < row["EMA21"] < row["EMA50"]: S += 1.0
@@ -1234,7 +1304,7 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
     if row["MACD_hist"] > 0 and row["MACD_hist"] > df.iloc[-3]["MACD_hist"]: L += 0.25
     if row["MACD_hist"] < 0 and row["MACD_hist"] < df.iloc[-3]["MACD_hist"]: S += 0.25
 
-    # 6. CVD (вес снижен с 1.0 до 0.75 — частично дублирует vol_dir)
+    # 6. CVD (вес снижен с 1.0 до 0.75 -- частично дублирует vol_dir)
     if row["CVD_up"]: L += 0.75
     else:             S += 0.75
 
@@ -1267,7 +1337,7 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
             if row["+DI"] > row["-DI"]: L += 0.25
             else:                       S += 0.25
 
-    # ═════ СРЕДНИЕ ═════════════════════════════════════
+    # ===== СРЕДНИЕ =====================================
     if   fear_greed < 25: L += 0.5
     elif fear_greed < 40: L += 0.25
     elif fear_greed > 75: S += 0.5
@@ -1309,7 +1379,7 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
     if price < row["VWAP"]: L += 0.5
     else:                   S += 0.5
 
-    # ═════ ВСПОМОГАТЕЛЬНЫЕ ═════════════════════════════
+    # ===== ВСПОМОГАТЕЛЬНЫЕ =============================
     if   btc_mom >  0.002: L += 0.25; S = max(0, S - 0.25)
     elif btc_mom < -0.002: S += 0.25; L = max(0, L - 0.25)
 
@@ -1339,7 +1409,7 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
     if   ob_delta >  3: L += 0.25
     elif ob_delta < -3: S += 0.25
 
-    # ═════ ШТРАФЫ ═══════════════════════════════════════
+    # ===== ШТРАФЫ =======================================
     if NIGHT_HOURS[0] <= hour or hour < NIGHT_HOURS[1]:
         if L >= S: L = max(0, L - 0.75)
         else:      S = max(0, S - 0.75)
@@ -1380,7 +1450,7 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
     if core_long  >= 4: L += 0.75
     if core_short >= 4: S += 0.75
 
-    # ═════ ML БОНУС ═════════════════════════════════════
+    # ===== ML БОНУС =====================================
     ml_metrics = {
         "fear_greed": fear_greed, "long_short": long_short, "taker_ratio": taker_ratio,
         "oi_change": oi_chg, "cb_premium": cb_premium, "eth_btc_chg": eth_btc_c,
@@ -1408,6 +1478,8 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
 
     # ВЫХОД С ATR-BASED SL/TP
     if L - S >= MIN_SCORE_DIFF and L >= MIN_SCORE:
+        if overheat_long:
+            return None, None, None, None, L, f"{reason_str} | Перегрев LONG +{dist_from_ema21:.1f}ATR от EMA21", L, S, ml_metrics
         sl_dist = max(price * SL_PCT_MIN, min(atr * SL_ATR_MULT, price * SL_PCT_MAX))
         tp_dist = min(atr * TP_ATR_MULT, price * TP_PCT_MAX)
         entry = price
@@ -1416,6 +1488,8 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
         return "LONG", entry, sl, tp, L, reason_str, L, S, ml_metrics
 
     if S - L >= MIN_SCORE_DIFF and S >= MIN_SCORE:
+        if overheat_short:
+            return None, None, None, None, S, f"{reason_str} | Перегрев SHORT -{dist_from_ema21:.1f}ATR от EMA21", L, S, ml_metrics
         sl_dist = max(price * SL_PCT_MIN, min(atr * SL_ATR_MULT, price * SL_PCT_MAX))
         tp_dist = min(atr * TP_ATR_MULT, price * TP_PCT_MAX)
         entry = price
@@ -1426,9 +1500,9 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
     return None, None, None, None, max(L, S), reason_str, L, S, ml_metrics
 
 
-# ════════════════════════════════════════════════════════
-# ML — с весами по времени, feature importance
-# ════════════════════════════════════════════════════════
+# ========================================================
+# ML -- с весами по времени, feature importance
+# ========================================================
 ML_FEATURE_NAMES = [
     "L", "S", "L-S", "FG", "L/S", "Taker", "OI%", "CB",
     "ETH/BTC", "Fund", "ADX", "RSI", "BB%", "OB", "BTCmom",
@@ -1535,7 +1609,7 @@ def _train_model():
         imp_str = " | ".join([f"{n}:{v*100:.0f}%" for n, v in imp])
 
         wr = sum(y) / len(y)
-        stats["ml_train_count"] += 1
+        stats["ml_trains_count"] += 1
         stats["ml_last_train_ts"] = now
         stats["ml_last_accuracy"] = cv_acc
         stats["ml_samples_at_last_train"] = len(X)
@@ -1545,7 +1619,7 @@ def _train_model():
             f"Примеров: {len(X)} | WR в выборке: {wr:.1%}\n"
             f"CV accuracy: {cv_acc:.1%}\n"
             f"Топ признаков: {imp_str}\n"
-            f"Всего обучений: {stats['ml_train_count']}"
+            f"Всего обучений: {stats['ml_trains_count']}"
         )
         storage_save_async()
         return True
@@ -1582,9 +1656,85 @@ def _maybe_retrain():
         threading.Thread(target=_do, daemon=True).start()
 
 
-# ════════════════════════════════════════════════════════
+
+# ========================================================
+# АНТИ-ЧЕЙЗИНГ / КУЛДАУН после закрытия сделки
+# ========================================================
+def cooldown_check(direction, current_price, df):
+    """Возвращает (allowed: bool, reason: str).
+    Блокирует повторный вход сразу после TP/SL чтобы избежать
+    'входа на пике' когда импульс уже выдохся."""
+
+    # Если ещё не было закрытий -- пропускаем
+    if last_close_ts == 0:
+        return True, ""
+
+    now = time.time()
+    elapsed = now - last_close_ts
+    elapsed_min = elapsed / 60
+
+    # 1. Базовый кулдаун (TP короче, SL дольше)
+    if last_close_result == "TP":
+        if elapsed < COOLDOWN_AFTER_TP:
+            remaining = (COOLDOWN_AFTER_TP - elapsed) / 60
+            return False, f"Кулдаун после TP ({remaining:.1f} мин ост)"
+    elif last_close_result == "SL":
+        if elapsed < COOLDOWN_AFTER_SL:
+            remaining = (COOLDOWN_AFTER_SL - elapsed) / 60
+            return False, f"Кулдаун после SL ({remaining:.1f} мин ост)"
+
+    # 2. Анти-чейзинг: за окно ANTI_CHASE_WINDOW
+    # если цена сильно ушла В ТУ ЖЕ сторону что и закрытая сделка -- не входим
+    if (last_close_direction == direction
+        and elapsed < ANTI_CHASE_WINDOW
+        and last_close_price > 0):
+
+        if direction == "LONG":
+            move_pct = (current_price - last_close_price) / last_close_price
+            if move_pct > ANTI_CHASE_PCT:
+                return False, f"Анти-чейз LONG: цена +{move_pct*100:.2f}% от exit"
+        else:
+            move_pct = (last_close_price - current_price) / last_close_price
+            if move_pct > ANTI_CHASE_PCT:
+                return False, f"Анти-чейз SHORT: цена -{move_pct*100:.2f}% от exit"
+
+    # 3. Перегрев индикаторов -- не входим в "перекупленность/перепроданность"
+    try:
+        row = df.iloc[-1]
+        rsi = row["RSI"]
+        bb_pct = row["BB_pct"]
+
+        if direction == "LONG":
+            if rsi > RSI_OVERHEAT_LONG:
+                return False, f"RSI перегрет ({rsi:.0f} > {RSI_OVERHEAT_LONG})"
+            if bb_pct > BB_OVERHEAT_LONG:
+                return False, f"BB перегрет ({bb_pct:.2f} > {BB_OVERHEAT_LONG})"
+        else:
+            if rsi < RSI_OVERHEAT_SHORT:
+                return False, f"RSI перепродан ({rsi:.0f} < {RSI_OVERHEAT_SHORT})"
+            if bb_pct < BB_OVERHEAT_SHORT:
+                return False, f"BB перепродан ({bb_pct:.2f} < {BB_OVERHEAT_SHORT})"
+    except Exception:
+        pass
+
+    # 4. После TP в одну сторону -- следующий вход в ту же сторону
+    # требует "перезагрузки" (откат цены к точке выхода)
+    if (last_close_result == "TP"
+        and last_close_direction == direction
+        and elapsed < ANTI_CHASE_WINDOW
+        and last_close_price > 0):
+
+        if direction == "LONG" and current_price > last_close_price:
+            return False, "Ждём отката после TP LONG"
+        if direction == "SHORT" and current_price < last_close_price:
+            return False, "Ждём отката после TP SHORT"
+
+    return True, ""
+
+
+# ========================================================
 # UI
-# ════════════════════════════════════════════════════════
+# ========================================================
 def score_bar(score):
     filled = min(10, max(0, round(score / MAX_SCORE * 10)))
     bar = "█" * filled + "░" * (10 - filled)
@@ -1592,9 +1742,9 @@ def score_bar(score):
     return f"{emoji} [{bar}] {score:.1f}/{MAX_SCORE}"
 
 
-# ════════════════════════════════════════════════════════
+# ========================================================
 # СКАН
-# ════════════════════════════════════════════════════════
+# ========================================================
 def run_scan():
     global last_scan_time, last_heartbeat_time, pause_until
     global yesterday_high, yesterday_low, losses_in_row, last_daily_report_day
@@ -1611,7 +1761,7 @@ def run_scan():
     if now - last_heartbeat_time >= 3600 or yesterday_high == 0:
         yesterday_high, yesterday_low = get_yesterday_levels()
 
-    df = get_klines(SYMBOL_BN, "5m", 200)
+    df = get_klines(SYMBOL_BN, TIMEFRAME, 200)
     if df is None:
         send_telegram("❌ Ошибка получения свечей")
         return
@@ -1641,6 +1791,17 @@ def run_scan():
         _send_daily_report()
 
     if direction is None:
+        return
+
+    # Кулдаун / анти-чейзинг
+    cd_ok, cd_reason = cooldown_check(direction, price, df)
+    if not cd_ok:
+        log.info(f"⏸ Вход заблокирован: {cd_reason}")
+        send_telegram(
+            f"⏸ <b>Вход заблокирован</b>\n"
+            f"Сигнал: {direction} score={score:.1f}\n"
+            f"Причина: {cd_reason}"
+        )
         return
 
     # Открытие
@@ -1714,9 +1875,9 @@ def _send_heartbeat(price, atr_val, L, S, score, direction):
     )
 
     ml_info = ""
-    if stats["ml_train_count"] > 0:
+    if stats["ml_trains_count"] > 0:
         last_train = datetime.fromtimestamp(stats["ml_last_train_ts"]).strftime("%d.%m %H:%M")
-        ml_info = (f"\n🧠 ML: {stats['ml_train_count']} обуч | "
+        ml_info = (f"\n🧠 ML: {stats['ml_trains_count']} обуч | "
                    f"acc:{stats['ml_last_accuracy']:.1%} | "
                    f"{stats['ml_samples_at_last_train']} примеров | {last_train}")
 
@@ -1762,16 +1923,16 @@ def _send_daily_report():
         f"  Просадка: {stats['max_drawdown']:.2f}\n"
         f"  Баланс: {bal:.2f} USDT\n\n"
         f"🧠 <b>ML:</b>\n"
-        f"  Обучений: {stats['ml_train_count']}\n"
+        f"  Обучений: {stats['ml_trains_count']}\n"
         f"  Последнее: {last_train_str}\n"
         f"  Accuracy: {stats['ml_last_accuracy']:.1%}\n"
         f"  Сделок до след.: {ML_RETRAIN_EVERY - ml_train_counter}"
     )
 
 
-# ════════════════════════════════════════════════════════
+# ========================================================
 # WATCHDOG
-# ════════════════════════════════════════════════════════
+# ========================================================
 def watchdog_loop():
     """Алерт если скан не работает дольше WATCHDOG_THRESHOLD."""
     last_alert = 0
@@ -1787,9 +1948,9 @@ def watchdog_loop():
                 )
 
 
-# ════════════════════════════════════════════════════════
+# ========================================================
 # FLASK
-# ════════════════════════════════════════════════════════
+# ========================================================
 @app.route("/")
 def home():
     return "OK", 200
@@ -1808,9 +1969,9 @@ def stats_endpoint():
     return json.dumps(stats, indent=2), 200, {"Content-Type": "application/json"}
 
 
-# ════════════════════════════════════════════════════════
+# ========================================================
 # MAIN LOOP
-# ════════════════════════════════════════════════════════
+# ========================================================
 def bot_loop():
     log.info("🚀 OKX Scalp Bot v6.0 starting")
 
@@ -1863,18 +2024,18 @@ def bot_loop():
         f"🚀 <b>OKX Scalp Bot v6.0</b>\n\n"
         f"💼 OKX | {SYMBOL}\n"
         f"📈 Плечо: x{LEVERAGE} | Сделка: {ORDER_USDT} USDT\n"
-        f"🎯 SL: {SL_ATR_MULT}×ATR | TP: {TP_ATR_MULT}×ATR (RR={TP_ATR_MULT/SL_ATR_MULT:.1f})\n"
+        f"🎯 SL: {SL_ATR_MULT}xATR | TP: {TP_ATR_MULT}xATR (RR={TP_ATR_MULT/SL_ATR_MULT:.1f})\n"
         f"⚙️ MIN_SCORE: {BASE_MIN_SCORE}/{MAX_SCORE} diff≥{MIN_SCORE_DIFF}\n"
         f"💰 Баланс: {bal:.2f} USDT\n"
         f"📊 История: {stats['total']} сд | ✅ {stats['wins']} ({winrate:.1f}%)\n"
         f"📜 Сигналов в базе: {len(signals_history)}\n\n"
         f"<b>Что в v6.0:</b>\n"
-        f"• Хранилище JSONBin — данные не теряются\n"
-        f"• ATR-based SL/TP, RR=2.0, плечо x20\n"
-        f"• Фикс багов: PnL по order_id, отмена алго\n"
-        f"• ML с весами по времени, retrain × 10\n"
-        f"• Watchdog + ежедневный отчёт\n"
-        f"• Спред-фильтр + фиксы метрик"
+        f"* Хранилище JSONBin -- данные не теряются\n"
+        f"* ATR-based SL/TP, RR=2.0, плечо x20\n"
+        f"* Фикс багов: PnL по order_id, отмена алго\n"
+        f"* ML с весами по времени, retrain x 10\n"
+        f"* Watchdog + ежедневный отчёт\n"
+        f"* Спред-фильтр + фиксы метрик"
     )
 
     while True:
