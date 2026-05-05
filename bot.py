@@ -105,9 +105,9 @@ TF_PRESETS = {
         "SL_PCT_MIN":     0.005,
         "SL_PCT_MAX":     0.025,
         "TP_PCT_MAX":     0.040,
-        "BASE_MIN_SCORE": 6.5,
+        "BASE_MIN_SCORE": 6.0,
         "MIN_SCORE_DIFF": 2.5,
-        "ADX_MIN":        20,
+        "ADX_MIN":        15,
         "SCAN_INTERVAL":  5 * 60,
         "HEARTBEAT_INT":  60 * 60,
         "MAX_HOLD_HRS":   6,
@@ -153,8 +153,8 @@ MIN_SCORE       = _p["BASE_MIN_SCORE"]
 MIN_SCORE_DIFF  = _p["MIN_SCORE_DIFF"]
 MAX_SCORE       = 13.0
 
-# Перегрев цены относительно EMA21 (опасно входить)
-EMA21_MAX_DIST_ATR = 1.5
+# Перегрев цены относительно EMA21 (опасно входить на пике)
+EMA21_MAX_DIST_ATR = 2.0
 
 # Фильтры
 ATR_MIN_PCT     = 0.0003
@@ -218,26 +218,54 @@ def jsonbin_load():
     return {}
 
 
-def jsonbin_save(data: dict) -> bool:
-    """Сохраняет record в JSONBin."""
+def jsonbin_save(data: dict, max_retries: int = 3) -> bool:
+    """Сохраняет в JSONBin. 3 попытки, экспоненциальный backoff (2с, 4с, 8с).
+    Таймаут 30с (было 15)."""
     if not JSONBIN_KEY or not JSONBIN_URL:
         return False
-    try:
-        r = requests.put(
-            JSONBIN_URL,
-            headers={
-                "X-Master-Key": JSONBIN_KEY,
-                "Content-Type": "application/json",
-            },
-            json=data,
-            timeout=15,
-        )
-        if r.status_code == 200:
-            return True
-        log.error(f"JSONBin PUT {r.status_code}: {r.text[:200]}")
-    except Exception as e:
-        log.error(f"JSONBin PUT error: {e}")
+
+    for attempt in range(max_retries):
+        try:
+            r = requests.put(
+                JSONBIN_URL,
+                headers={
+                    "X-Master-Key": JSONBIN_KEY,
+                    "Content-Type": "application/json",
+                },
+                json=data,
+                timeout=30,
+            )
+            if r.status_code == 200:
+                if attempt > 0:
+                    log.info(f"JSONBin PUT OK с попытки {attempt + 1}")
+                return True
+            log.error(f"JSONBin PUT {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            log.error(f"JSONBin PUT error (попытка {attempt + 1}/{max_retries}): {e}")
+
+        if attempt < max_retries - 1:
+            time.sleep(2 ** (attempt + 1))  # 2с, 4с, 8с
+
+    # Все попытки провалились -- складываем в очередь
+    _pending_save_queue.append(data)
+    log.warning(f"JSONBin сохранение в очередь, всего отложено: {len(_pending_save_queue)}")
     return False
+
+
+# Очередь отложенных сохранений (если JSONBin лежит)
+_pending_save_queue = []
+
+
+def jsonbin_flush_pending():
+    """Пытается дослать отложенные сохранения. Запускается раз в минуту."""
+    if not _pending_save_queue:
+        return
+    # Берём только последнее (свежее перезатирает старое)
+    latest = _pending_save_queue[-1]
+    _pending_save_queue.clear()
+    log.info(f"JSONBin: пробую сбросить очередь")
+    if not jsonbin_save(latest, max_retries=2):
+        log.warning("JSONBin: сброс очереди не удался")
 
 
 # ========================================================
@@ -356,11 +384,15 @@ def storage_load_all():
     last_close_direction = data.get("last_close_direction")
     last_close_price     = data.get("last_close_price", 0.0) or 0.0
 
+    global ml_train_counter
+    ml_train_counter = int(data.get("ml_train_counter", 0) or 0)
+
     log.info(
         f"Загружено: signals={len(signals_history)} "
         f"trades={stats['total']} "
         f"active={len(active_positions)} "
-        f"min_score={MIN_SCORE}"
+        f"min_score={MIN_SCORE} "
+        f"ml_counter={ml_train_counter}"
     )
 
 
@@ -376,6 +408,7 @@ def storage_save_all():
             "last_close_result":    last_close_result,
             "last_close_direction": last_close_direction,
             "last_close_price":     last_close_price,
+            "ml_train_counter": ml_train_counter,
             "last_updated":     datetime.now(timezone.utc).isoformat(),
         }
         ok = jsonbin_save(data)
@@ -549,6 +582,26 @@ def okx_place_order(direction, entry, sl, tp):
 
     order_id = r["data"][0].get("ordId", "")
 
+    # SANITY CHECK: ждём 3 сек и проверяем что позиция действительно появилась
+    # Это защита от "фантомных" сделок когда биржа вернула code:0 но позиции нет
+    time.sleep(3)
+    real_positions = okx_get_positions()
+    pos_actually_open = any(
+        p.get("posSide") == pos_side and abs(float(p.get("pos", 0))) > 0
+        for p in real_positions
+    )
+
+    if not pos_actually_open:
+        log.error(f"SANITY FAIL: позиция {order_id} не появилась на бирже!")
+        send_telegram(
+            f"🚨 <b>ФАНТОМНАЯ СДЕЛКА</b>\n"
+            f"Биржа приняла ордер ({order_id}), но позиция не открылась.\n"
+            f"Запись в историю отменена."
+        )
+        return {"ok": False, "step": "sanity_check", "msg": "Position not found on exchange"}
+
+    log.info(f"SANITY OK: позиция {pos_side} qty={total_qty} подтверждена биржей")
+
     # SL
     sl_algo_id = None
     for _ in range(3):
@@ -586,6 +639,26 @@ def okx_place_order(direction, entry, sl, tp):
             tp_algo_id = tp_r["data"][0].get("algoId", "")
             break
         time.sleep(1)
+
+    # КРАСНЫЙ АЛЕРТ если позиция голая (нет ни SL ни TP)
+    if sl_algo_id is None and tp_algo_id is None:
+        send_telegram(
+            f"🚨🚨🚨 <b>ГОЛАЯ ПОЗИЦИЯ!</b>\n"
+            f"{direction} qty={total_qty} entry={entry:.2f}\n"
+            f"НИ SL НИ TP не поставились!\n"
+            f"Ручное вмешательство обязательно!"
+        )
+    elif sl_algo_id is None:
+        send_telegram(
+            f"⚠️ <b>SL не поставлен</b>\n"
+            f"{direction} entry={entry:.2f} TP={tp:.2f}\n"
+            f"Позиция без стопа!"
+        )
+    elif tp_algo_id is None:
+        send_telegram(
+            f"⚠️ <b>TP не поставлен</b>\n"
+            f"{direction} entry={entry:.2f} SL={sl:.2f}"
+        )
 
     active_positions[order_id] = {
         "direction":  direction,
@@ -775,7 +848,8 @@ def _handle_position_close(order_id, pos):
         f"P&L итого: {stats['total_profit']:+.2f} | Ср: {avg_pnl:+.2f}\n"
         f"Лучшая: {stats['best_trade']:+.2f} | Худшая: {stats['worst_trade']:+.2f}\n"
         f"Profit factor: {pf:.2f} | Просадка: {stats['max_drawdown']:.2f}\n"
-        f"MIN: {MIN_SCORE}"
+        f"MIN: {MIN_SCORE}\n"
+        f"🧠 До ML retrain: {ML_RETRAIN_EVERY - ml_train_counter - 1} сделок"
     )
 
     # Удаляем
@@ -2003,11 +2077,17 @@ def _send_daily_report():
 # WATCHDOG
 # ========================================================
 def watchdog_loop():
-    """Алерт если скан не работает дольше WATCHDOG_THRESHOLD."""
+    """Алерт если скан не работает дольше WATCHDOG_THRESHOLD.
+    + Каждую минуту сбрасывает отложенные сохранения JSONBin."""
     last_alert = 0
     while True:
         time.sleep(60)
         now = time.time()
+
+        # Сбрасываем очередь JSONBin
+        if _pending_save_queue:
+            jsonbin_flush_pending()
+
         if last_scan_time > 0 and now - last_scan_time > WATCHDOG_THRESHOLD:
             if now - last_alert > 600:
                 last_alert = now
@@ -2047,10 +2127,29 @@ def bot_loop():
     # Загрузка данных
     storage_load_all()
 
-    # Тренировка ML на старте если есть данные
-    if len([s for s in signals_history if s.get("label") is not None]) >= ML_MIN_SAMPLES:
+    # ML диагностика при старте
+    labeled = [s for s in signals_history if s.get("label") is not None]
+    unlabeled = [s for s in signals_history if s.get("label") is None]
+    ml_status_msg = ""
+
+    log.info(f"ML диагностика: всего сигналов={len(signals_history)}, "
+             f"с метками={len(labeled)}, без меток={len(unlabeled)}, "
+             f"счётчик до переобучения={ml_train_counter}/{ML_RETRAIN_EVERY}")
+
+    if len(labeled) >= ML_MIN_SAMPLES:
         log.info("Тренировка ML на старте...")
-        _train_model()
+        if _train_model():
+            ml_status_msg = (
+                f"🧠 ML обучена на {len(labeled)} сделках\n"
+                f"До следующего обучения: {ML_RETRAIN_EVERY - ml_train_counter} закрытий"
+            )
+        else:
+            ml_status_msg = "⚠️ ML обучение провалилось (см логи)"
+    else:
+        ml_status_msg = (
+            f"📊 ML: данных мало ({len(labeled)}/{ML_MIN_SAMPLES})\n"
+            f"Жду ещё {ML_MIN_SAMPLES - len(labeled)} закрытых сделок до первого обучения"
+        )
 
     # Восстановление активных позиций (свериться с биржей)
     try:
@@ -2089,22 +2188,29 @@ def bot_loop():
 
     winrate = (stats["wins"] / stats["total"] * 100) if stats["total"] > 0 else 0
 
+    rr = TP_ATR_MULT / SL_ATR_MULT
+    tr_hours = "круглосуточно" if TRADING_HOURS is None else f"{TRADING_HOURS[0]}-{TRADING_HOURS[1]} UTC"
+
     send_telegram(
-        f"🚀 <b>OKX Scalp Bot v6.0</b>\n\n"
+        f"🚀 <b>OKX Bot v6.3 [{TIMEFRAME}]</b>\n\n"
         f"💼 OKX | {SYMBOL}\n"
         f"📈 Плечо: x{LEVERAGE} | Сделка: {ORDER_USDT} USDT\n"
-        f"🎯 SL: {SL_ATR_MULT}xATR | TP: {TP_ATR_MULT}xATR (RR={TP_ATR_MULT/SL_ATR_MULT:.1f})\n"
-        f"⚙️ MIN_SCORE: {BASE_MIN_SCORE}/{MAX_SCORE} diff≥{MIN_SCORE_DIFF}\n"
+        f"⏱ Таймфрейм: <b>{TIMEFRAME}</b>\n"
+        f"🎯 SL: {SL_ATR_MULT}xATR | TP: {TP_ATR_MULT}xATR (RR={rr:.2f})\n"
+        f"⚙️ MIN: {BASE_MIN_SCORE}/{MAX_SCORE} diff>={MIN_SCORE_DIFF}\n"
+        f"📐 ADX_min={ADX_MIN} | EMA21_dist={EMA21_MAX_DIST_ATR}xATR\n"
+        f"⏰ Окно: {tr_hours}\n"
+        f"🕐 Time-stop: {MAX_HOLD_HOURS}ч\n"
         f"💰 Баланс: {bal:.2f} USDT\n"
         f"📊 История: {stats['total']} сд | ✅ {stats['wins']} ({winrate:.1f}%)\n"
         f"📜 Сигналов в базе: {len(signals_history)}\n\n"
-        f"<b>Что в v6.0:</b>\n"
-        f"* Хранилище JSONBin -- данные не теряются\n"
-        f"* ATR-based SL/TP, RR=2.0, плечо x20\n"
-        f"* Фикс багов: PnL по order_id, отмена алго\n"
-        f"* ML с весами по времени, retrain x 10\n"
-        f"* Watchdog + ежедневный отчёт\n"
-        f"* Спред-фильтр + фиксы метрик"
+        f"{ml_status_msg}\n\n"
+        f"<b>Изменения v6.3:</b>\n"
+        f"* Фильтры ослаблены (ADX>=15, EMA21 2xATR)\n"
+        f"* Sanity check после market-ордера\n"
+        f"* JSONBin retry x3 + очередь\n"
+        f"* Алерт о голой позиции\n"
+        f"* ML счётчик переживает рестарт"
     )
 
     while True:
