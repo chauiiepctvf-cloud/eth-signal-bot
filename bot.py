@@ -168,14 +168,14 @@ PAUSE_LOSSES    = 1800
 ETH_BTC_CORR_MIN= 0.3
 
 # Кулдаун после закрытия сделки (анти-чейзинг)
-COOLDOWN_AFTER_TP   = 15 * 60   # 15 мин после TP -- не входим
-COOLDOWN_AFTER_SL   = 30 * 60   # 30 мин после SL -- дольше остываем
+COOLDOWN_AFTER_TP   = 10 * 60   # 15 мин после TP -- не входим
+COOLDOWN_AFTER_SL   = 20 * 60   # 30 мин после SL -- дольше остываем
 ANTI_CHASE_PCT      = 0.005     # если цена ушла >0.5% от точки выхода -- не лезем в ту же сторону
 ANTI_CHASE_WINDOW   = 30 * 60   # окно проверки 30 мин
 RSI_OVERHEAT_LONG   = 75        # выше -- не лонгуем
 RSI_OVERHEAT_SHORT  = 25        # ниже -- не шортим
-BB_OVERHEAT_LONG    = 0.9       # BB% выше -- не лонгуем
-BB_OVERHEAT_SHORT   = 0.1       # BB% ниже -- не шортим
+BB_OVERHEAT_LONG    = 0.95       # BB% выше -- не лонгуем
+BB_OVERHEAT_SHORT   = 0.5       # BB% ниже -- не шортим
 
 # ML
 ML_RETRAIN_EVERY= 10            # было 20
