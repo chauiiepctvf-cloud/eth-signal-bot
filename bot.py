@@ -2041,7 +2041,7 @@ def _send_heartbeat(price, atr_val, L, S, score, direction):
         f"{session} Баланс: {bal:.2f} USDT | Поз:{len(pos)}\n"
         f"🎯 {sig_status} L:{L:.1f} S:{S:.1f}\n"
         f"⚙️ MIN:{MIN_SCORE} База:{BASE_MIN_SCORE}\n"
-        f"📊 {stats['total']} сд ✅{stats['wins']} ({winrate:.1f}%) "
+        f"📊 {stats['total']} сд ✅{stats['wins']} 🔴{stats['losses']} ({winrate:.1f}%) "
         f"PF:{pf:.2f}\n"
         f"💵 P&L: {stats['total_profit']:+.2f} USDT"
         f"{ml_info}\n"
