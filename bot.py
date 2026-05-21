@@ -1328,6 +1328,15 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
     rsi   = row["RSI"]
     atr   = row["ATR"]
     adx   = row["ADX"] if not np.isnan(row.get("ADX", float("nan"))) else 20
+    # Адаптивный режим: тренд vs канал
+    if adx >= 25:
+        current_min_score = BASE_MIN_SCORE
+        sl_mult = SL_ATR_MULT
+        tp_mult = TP_ATR_MULT
+    else:
+        current_min_score = BASE_MIN_SCORE - 1.5
+        sl_mult = SL_ATR_MULT * 0.7
+        tp_mult = TP_ATR_MULT * 0.6
 
     # Жёсткие фильтры
     if atr < price * ATR_MIN_PCT:
@@ -1620,21 +1629,21 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
     )
 
     # ВЫХОД С ATR-BASED SL/TP
-    if L - S >= MIN_SCORE_DIFF and L >= MIN_SCORE:
+    if L - S >= MIN_SCORE_DIFF and L >= current_min_score:
         if overheat_long:
             return None, None, None, None, L, f"{reason_str} | Перегрев LONG +{dist_from_ema21:.1f}ATR от EMA21", L, S, ml_metrics
-        sl_dist = max(price * SL_PCT_MIN, min(atr * SL_ATR_MULT, price * SL_PCT_MAX))
-        tp_dist = min(atr * TP_ATR_MULT, price * TP_PCT_MAX)
+        sl_dist = max(price * SL_PCT_MIN, min(atr * sl_mult, price * SL_PCT_MAX))
+        tp_dist = min(atr * tp_mult, price * TP_PCT_MAX)
         entry = price
         sl    = round(entry - sl_dist, 2)
         tp    = round(entry + tp_dist, 2)
         return "LONG", entry, sl, tp, L, reason_str, L, S, ml_metrics
 
-    if S - L >= MIN_SCORE_DIFF and S >= MIN_SCORE:
+    if S - L >= MIN_SCORE_DIFF and S >= current_min_score:
         if overheat_short:
             return None, None, None, None, S, f"{reason_str} | Перегрев SHORT -{dist_from_ema21:.1f}ATR от EMA21", L, S, ml_metrics
-        sl_dist = max(price * SL_PCT_MIN, min(atr * SL_ATR_MULT, price * SL_PCT_MAX))
-        tp_dist = min(atr * TP_ATR_MULT, price * TP_PCT_MAX)
+        sl_dist = max(price * SL_PCT_MIN, min(atr * sl_mult, price * SL_PCT_MAX))
+        tp_dist = min(atr * tp_mult, price * TP_PCT_MAX)
         entry = price
         sl    = round(entry + sl_dist, 2)
         tp    = round(entry - tp_dist, 2)
