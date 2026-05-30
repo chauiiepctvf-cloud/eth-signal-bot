@@ -1673,7 +1673,10 @@ def run_backtest(days=30):
     trades = []
     for i in range(50, len(df) - 1):
         window = df.iloc[:i+1].copy()
-        sig = get_signal(window, 0.0, 0.0, 0.0, 0.0, 0)
+        try:
+            sig = get_signal(window, 0.0, 0.0, 0.0, 0.0, 0)
+        except Exception:
+            continue
         if sig[0] is None:
             continue
         direction, entry, sl, tp, score, reason, L, S, _ = sig
