@@ -184,6 +184,14 @@ ML_DECAY_DAYS   = 7
 
 FORCE_TEST      = False
 
+# Бэктест
+BACKTEST_DAYS_INITIAL = 30
+BACKTEST_DAYS_WEEKLY = 7
+BACKTEST_AUTO_DAY = 6
+BACKTEST_AUTO_HOUR = 22
+BACKTEST_VIRTUAL_WEIGHT = 0.3
+backtest_done_initial = False
+
 # ========================================================
 # ЛОГИРОВАНИЕ
 # ========================================================
@@ -1653,6 +1661,58 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
 
 
 # ========================================================
+# БЭКТЕСТ
+# ========================================================
+def run_backtest(days=30):
+    log.info(f"📊 Бэктест за {days} дней запущен")
+    df = get_klines(SYMBOL_BN, TIMEFRAME, limit=days * 24 * 4)
+    if df is None or len(df) < 50:
+        send_telegram("❌ Бэктест: не хватает свечей")
+        return
+    df = calc(df)
+    trades = []
+    for i in range(50, len(df) - 1):
+        window = df.iloc[:i+1].copy()
+        sig = get_signal(window, 0.0, 0.0, 0.0, 0.0, 0)
+        if sig[0] is None:
+            continue
+        direction, entry, sl, tp, score, reason, L, S, _ = sig
+        future = df.iloc[i+1:]
+        close_price = None
+        close_reason = None
+        for j in range(len(future)):
+            high = future.iloc[j]["high"]
+            low = future.iloc[j]["low"]
+            if direction == "LONG":
+                if low <= sl:
+                    close_price = sl; close_reason = "SL"; break
+                if high >= tp:
+                    close_price = tp; close_reason = "TP"; break
+            else:
+                if high >= sl:
+                    close_price = sl; close_reason = "SL"; break
+                if low <= tp:
+                    close_price = tp; close_reason = "TP"; break
+        if close_price:
+            pnl = (close_price - entry) / entry * 100 if direction == "LONG" else (entry - close_price) / entry * 100
+            trades.append({
+                "direction": direction, "entry": entry, "sl": sl, "tp": tp,
+                "score": score, "L": L, "S": S, "result": close_reason,
+                "label": 1 if close_reason == "TP" else 0, "pnl_pct": round(pnl, 4),
+                "source": "backtest", "weight": BACKTEST_VIRTUAL_WEIGHT,
+                "timestamp": time.time() - (len(df) - i) * 5 * 60, "metrics": {},
+            })
+    if trades:
+        wins = sum(1 for t in trades if t["label"] == 1)
+        wr = wins / len(trades) * 100
+        send_telegram(f"📊 БЭКТЕСТ за {days} дней\nСделок: {len(trades)} | ✅ {wins} | 🔴 {len(trades)-wins}\nВинрейт: {wr:.1f}%\nДобавлено в ML с весом {BACKTEST_VIRTUAL_WEIGHT}")
+        for t in trades:
+            signals_history.append(t)
+        log.info(f"Бэктест: {len(trades)} сделок добавлено")
+    else:
+        send_telegram(f"📊 Бэктест за {days} дней: 0 сделок")
+
+# ========================================================
 # ML -- с весами по времени, feature importance
 # ========================================================
 ML_FEATURE_NAMES = [
@@ -1734,6 +1794,8 @@ def _train_model():
         ts_arr = np.array([s.get("timestamp", now) for s in done])
         ages_days = (now - ts_arr) / 86400
         weights = np.exp(-ages_days / ML_DECAY_DAYS)
+        custom_weights = np.array([s.get("weight", 1.0) for s in done])
+        weights = weights * custom_weights
 
         sc = StandardScaler()
         Xs = sc.fit_transform(X)
@@ -2126,6 +2188,11 @@ def health():
 def stats_endpoint():
     return json.dumps(stats, indent=2), 200, {"Content-Type": "application/json"}
 
+@app.route('/backtest')
+def backtest_endpoint():
+    threading.Thread(target=run_backtest, args=(BACKTEST_DAYS_INITIAL,), daemon=True).start()
+    return "Backtest started", 200
+
 
 # ========================================================
 # MAIN LOOP
@@ -2225,6 +2292,15 @@ def bot_loop():
     while True:
         try:
             run_scan()
+            now = time.time()
+            dow = datetime.now(timezone.utc).weekday()
+            hour = datetime.now(timezone.utc).hour
+            if dow == BACKTEST_AUTO_DAY and hour == BACKTEST_AUTO_HOUR:
+                if not backtest_done_initial:
+                    threading.Thread(target=run_backtest, args=(BACKTEST_DAYS_INITIAL,), daemon=True).start()
+                    backtest_done_initial = True
+                elif datetime.now(timezone.utc).minute < 10:
+                    threading.Thread(target=run_backtest, args=(BACKTEST_DAYS_WEEKLY,), daemon=True).start()
         except Exception as e:
             log.error(f"run_scan: {e}")
             send_telegram(f"⚠️ Ошибка скана: {e}")
