@@ -1670,6 +1670,11 @@ def run_backtest(days=30):
         send_telegram("❌ Бэктест: не хватает свечей")
         return
     df = calc(df)
+    # Заморозить кэш внешних API на время бэктеста
+    cache_backup = {}
+    for k in cache:
+        cache_backup[k] = dict(cache[k])
+        cache[k]["ts"] = float('inf')
     trades = []
     for i in range(50, len(df) - 1):
         window = df.iloc[:i+1].copy()
@@ -1705,6 +1710,10 @@ def run_backtest(days=30):
                 "source": "backtest", "weight": BACKTEST_VIRTUAL_WEIGHT,
                 "timestamp": time.time() - (len(df) - i) * 5 * 60, "metrics": {},
             })
+    # Восстановить кэш внешних API
+    for k in cache_backup:
+        cache[k] = cache_backup[k]
+
     if trades:
         wins = sum(1 for t in trades if t["label"] == 1)
         wr = wins / len(trades) * 100
