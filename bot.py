@@ -150,6 +150,8 @@ DAILY_REPORT_HOUR  = 23
 
 BASE_MIN_SCORE  = _p["BASE_MIN_SCORE"]
 MIN_SCORE       = _p["BASE_MIN_SCORE"]
+MIN_SCORE_LONG  = _p["BASE_MIN_SCORE"]
+MIN_SCORE_SHORT = _p["BASE_MIN_SCORE"] - 0.5
 MIN_SCORE_DIFF  = _p["MIN_SCORE_DIFF"]
 MAX_SCORE       = 13.0
 
@@ -183,6 +185,13 @@ ML_MIN_SAMPLES  = 30
 ML_DECAY_DAYS   = 7
 
 FORCE_TEST      = False
+
+# Важные новости (UTC): год, месяц, день, час, минута
+NEWS_EVENTS = [
+    (2026, 6, 12, 12, 30),  # CPI
+    (2026, 6, 18, 18, 0),   # FOMC
+    (2026, 7, 3, 12, 30),   # NFP
+]
 
 # Бэктест
 BACKTEST_DAYS_INITIAL = 30
@@ -311,6 +320,7 @@ force_test_done  = False
 scalp_model      = None
 ml_train_counter = 0
 last_vwap_reset_day = -1
+analyzer_status = "✅ норма"
 
 # Кэш внешних метрик
 cache = {
@@ -629,24 +639,57 @@ def okx_place_order(direction, entry, sl, tp):
             break
         time.sleep(1)
 
-    # TP
+    # TP1: 50% позиции на 1.5 ATR
+    atr_val = float(requests.get(
+        f"https://api.binance.com/api/v3/klines?symbol={SYMBOL_BN}&interval=15m&limit=14", timeout=5
+    ).json()[-1][5]) - float(requests.get(
+        f"https://api.binance.com/api/v3/klines?symbol={SYMBOL_BN}&interval=15m&limit=14", timeout=5
+    ).json()[-1][4])
+    tp1_dist = atr_val * 1.5 if atr_val > 0 else abs(entry - sl) * 0.5
+    tp1_price = round(entry + tp1_dist, 2) if direction == "LONG" else round(entry - tp1_dist, 2)
+    tp1_qty = total_qty // 2
+    tp1_algo_id = None
+
+    if tp1_qty > 0:
+        for _ in range(3):
+            tp1_r = okx_post("/api/v5/trade/order-algo", {
+                "instId":   SYMBOL,
+                "tdMode":   "cross",
+                "side":     cls_side,
+                "posSide":  pos_side,
+                "ordType":  "conditional",
+                "sz":       str(tp1_qty),
+                "tpTriggerPx":     str(tp1_price),
+                "tpOrdPx":         "-1",
+                "tpTriggerPxType": "last",
+            })
+            if tp1_r.get("code") == "0":
+                tp1_algo_id = tp1_r["data"][0].get("algoId", "")
+                log.info(f"TP1={tp1_price:.2f} qty={tp1_qty}")
+                break
+            time.sleep(1)
+
+    # TP2: оставшиеся 50% на основном TP
+    tp2_qty = total_qty - tp1_qty
     tp_algo_id = None
-    for _ in range(3):
-        tp_r = okx_post("/api/v5/trade/order-algo", {
-            "instId":   SYMBOL,
-            "tdMode":   "cross",
-            "side":     cls_side,
-            "posSide":  pos_side,
-            "ordType":  "conditional",
-            "sz":       str(total_qty),
-            "tpTriggerPx":     str(round(tp, 2)),
-            "tpOrdPx":         "-1",
-            "tpTriggerPxType": "last",
-        })
-        if tp_r.get("code") == "0":
-            tp_algo_id = tp_r["data"][0].get("algoId", "")
-            break
-        time.sleep(1)
+    if tp2_qty > 0:
+        for _ in range(3):
+            tp_r = okx_post("/api/v5/trade/order-algo", {
+                "instId":   SYMBOL,
+                "tdMode":   "cross",
+                "side":     cls_side,
+                "posSide":  pos_side,
+                "ordType":  "conditional",
+                "sz":       str(tp2_qty),
+                "tpTriggerPx":     str(round(tp, 2)),
+                "tpOrdPx":         "-1",
+                "tpTriggerPxType": "last",
+            })
+            if tp_r.get("code") == "0":
+                tp_algo_id = tp_r["data"][0].get("algoId", "")
+                log.info(f"TP2={tp:.2f} qty={tp2_qty}")
+                break
+            time.sleep(1)
 
     # КРАСНЫЙ АЛЕРТ если позиция голая (нет ни SL ни TP)
     if sl_algo_id is None and tp_algo_id is None:
@@ -679,8 +722,10 @@ def okx_place_order(direction, entry, sl, tp):
         "open_time":  time.time(),
         "sl_algo_id": sl_algo_id,
         "tp_algo_id": tp_algo_id,
+        "tp1_algo_id": tp1_algo_id,
         "sl_ok":      sl_algo_id is not None,
         "tp_ok":      tp_algo_id is not None,
+        "tp1_ok":     tp1_algo_id is not None,
     }
     storage_save_async()
 
@@ -1450,10 +1495,18 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
             if S > L: S += 0.25
 
     # 4. RSI
-    if   rsi < 35: L += 1.0
-    elif rsi < 45: L += 0.5
-    elif rsi > 65: S += 1.0
-    elif rsi > 55: S += 0.5
+    if adx < 25:
+        if   rsi < 30: L += 1.0
+        elif rsi < 35: L += 0.75
+        elif rsi < 45: L += 0.5
+        elif rsi > 70: S += 1.0
+        elif rsi > 65: S += 0.75
+        elif rsi > 55: S += 0.5
+    else:
+        if   rsi < 35: L += 1.0
+        elif rsi < 45: L += 0.5
+        elif rsi > 65: S += 1.0
+        elif rsi > 55: S += 0.5
 
     # 5. MACD
     if row["MACD_bull"]: L += 1.0
@@ -1531,10 +1584,19 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
         else:                            L += 0.25
 
     bp = row["BB_pct"]
-    if   bp < 0.1: L += 0.5
-    elif bp < 0.2: L += 0.25
-    elif bp > 0.9: S += 0.5
-    elif bp > 0.8: S += 0.25
+    if adx < 25:
+        if   bp < 0.1: L += 1.0
+        elif bp < 0.2: L += 0.75
+        elif bp > 0.9: S += 1.0
+        elif bp > 0.8: S += 0.75
+        elif 0.3 < bp < 0.7:
+            L = max(0, L - 1.0)
+            S = max(0, S - 1.0)
+    else:
+        if   bp < 0.1: L += 0.5
+        elif bp < 0.2: L += 0.25
+        elif bp > 0.9: S += 0.5
+        elif bp > 0.8: S += 0.25
 
     if price < row["VWAP"]: L += 0.5
     else:                   S += 0.5
@@ -1569,6 +1631,51 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
     if   ob_delta >  3: L += 0.25
     elif ob_delta < -3: S += 0.25
 
+   # Штраф за низкий объём
+    vol_24h_avg = df["volume"].iloc[-96:].mean() if len(df) >= 96 else df["volume"].mean()
+    vol_ratio = row["volume"] / vol_24h_avg if vol_24h_avg > 0 else 1.0
+    if vol_ratio < 0.5:
+        L = max(0, L - 1.5)
+        S = max(0, S - 1.5)
+    elif vol_ratio < 0.7:
+        L = max(0, L - 1.0)
+        S = max(0, S - 1.0)
+    elif vol_ratio < 1.0:
+        L = max(0, L - 0.5)
+        S = max(0, S - 0.5)
+
+    # Штраф за близость к новостям
+    for ev in NEWS_EVENTS:
+        try:
+            ev_time = datetime(ev[0], ev[1], ev[2], ev[3], ev[4], tzinfo=timezone.utc)
+            dist_min = abs((datetime.now(timezone.utc) - ev_time).total_seconds()) / 60
+            if dist_min < 15:
+                L = max(0, L - 2.0)
+                S = max(0, S - 2.0)
+            elif dist_min < 30:
+                L = max(0, L - 1.0)
+                S = max(0, S - 1.0)
+            elif dist_min < 60:
+                L = max(0, L - 0.5)
+                S = max(0, S - 0.5)
+        except:
+            pass
+
+    # Подтверждение по 1h таймфрейму
+    df_1h = get_klines(SYMBOL_BN, "1h", 100)
+    if df_1h is not None and len(df_1h) >= 50:
+        df_1h = calc(df_1h)
+        sig_1h = get_signal(df_1h, 0.0, 0.0, 0.0, 0.0, 0)
+        if sig_1h[0] is not None:
+            if sig_1h[0] == "LONG" and sig_1h[4] >= 5.0:
+                L += 0.5
+            elif sig_1h[0] == "SHORT" and sig_1h[4] >= 5.0:
+                S += 0.5
+            elif sig_1h[0] == "LONG":
+                S = max(0, S - 2.0)
+            elif sig_1h[0] == "SHORT":
+                L = max(0, L - 2.0)
+
     # ===== ШТРАФЫ =======================================
     if NIGHT_HOURS[0] <= hour or hour < NIGHT_HOURS[1]:
         if L >= S: L = max(0, L - 0.75)
@@ -1590,10 +1697,12 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
         L = 0
 
     if yesterday_high > 0 and yesterday_low > 0:
-        if   price < yesterday_low:                  L = max(0, L - 0.5)
-        elif price > yesterday_high:                 S = max(0, S - 0.5)
-        elif yesterday_low < price < yesterday_low * 1.01:    L += 0.25
-        elif yesterday_high * 0.99 < price < yesterday_high:  S += 0.25
+        if   price < yesterday_low:                  L = max(0, L - 0.5); S = max(0, S - 0.5)
+        elif price > yesterday_high:                 S = max(0, S - 0.5); L = max(0, L - 0.5)
+        elif yesterday_low < price < yesterday_low * 1.01:
+            L += 1.0 if adx < 25 else 0.25
+        elif yesterday_high * 0.99 < price < yesterday_high:
+            S += 1.0 if adx < 25 else 0.25
 
     # Конфлюэнция (4 из 6)
     ema_l = row["EMA9"] > row["EMA21"] > row["EMA50"]
@@ -1637,7 +1746,7 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
     )
 
     # ВЫХОД С ATR-BASED SL/TP
-    if L - S >= MIN_SCORE_DIFF and L >= current_min_score:
+    if L - S >= MIN_SCORE_DIFF and L >= current_min_score and L >= MIN_SCORE_LONG:
         if overheat_long:
             return None, None, None, None, L, f"{reason_str} | Перегрев LONG +{dist_from_ema21:.1f}ATR от EMA21", L, S, ml_metrics
         sl_dist = max(price * SL_PCT_MIN, min(atr * sl_mult, price * SL_PCT_MAX))
@@ -1647,7 +1756,7 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
         tp    = round(entry + tp_dist, 2)
         return "LONG", entry, sl, tp, L, reason_str, L, S, ml_metrics
 
-    if S - L >= MIN_SCORE_DIFF and S >= current_min_score:
+    if S - L >= MIN_SCORE_DIFF and S >= current_min_score and S >= MIN_SCORE_SHORT:
         if overheat_short:
             return None, None, None, None, S, f"{reason_str} | Перегрев SHORT -{dist_from_ema21:.1f}ATR от EMA21", L, S, ml_metrics
         sl_dist = max(price * SL_PCT_MIN, min(atr * sl_mult, price * SL_PCT_MAX))
@@ -1884,6 +1993,96 @@ def _maybe_retrain():
 
 
 # ========================================================
+# BACKTEST ANALYZER -- сравнение вирт/реал, авто-правки
+# ========================================================
+ANALYZER_MAX_CHANGE = 0.25
+last_analyzer_ts = 0.0
+analyzer_status = "✅ норма"
+
+def backtest_analyzer():
+    global last_analyzer_ts, analyzer_status, MIN_SCORE, MIN_SCORE_LONG, MIN_SCORE_SHORT
+    now = time.time()
+    if now - last_analyzer_ts < 7 * 86400:
+        return
+    virtual = [s for s in signals_history if s.get("source") == "backtest" and "label" in s]
+    real = [s for s in signals_history if s.get("source") != "backtest" and "label" in s
+            and (now - s.get("timestamp", 0)) < 30 * 86400]
+    if len(virtual) < 5 or len(real) < 5:
+        analyzer_status = "✅ мало данных"
+        return
+    v_wr = sum(1 for s in virtual if s.get("label") == 1) / len(virtual) * 100
+    r_wr = sum(1 for s in real if s.get("label") == 1) / len(real) * 100
+    gap = v_wr - r_wr
+    if gap > 15:
+        analyzer_status = f"🚨 разрыв {gap:.0f}% MIN_SCORE -0.25"
+        MIN_SCORE = max(3.0, MIN_SCORE - ANALYZER_MAX_CHANGE)
+        MIN_SCORE_LONG = max(3.0, MIN_SCORE_LONG - ANALYZER_MAX_CHANGE)
+        MIN_SCORE_SHORT = max(2.5, MIN_SCORE_SHORT - ANALYZER_MAX_CHANGE)
+        last_analyzer_ts = now
+        send_telegram(f"🚨 Analyzer: разрыв {gap:.0f}%\nMIN_SCORE снижен на {ANALYZER_MAX_CHANGE}")
+    elif gap > 10:
+        analyzer_status = f"⚠️ разрыв {gap:.0f}% MIN_SCORE -0.15"
+        MIN_SCORE = max(3.0, MIN_SCORE - 0.15)
+        MIN_SCORE_LONG = max(3.0, MIN_SCORE_LONG - 0.15)
+        MIN_SCORE_SHORT = max(2.5, MIN_SCORE_SHORT - 0.15)
+        last_analyzer_ts = now
+        send_telegram(f"⚠️ Analyzer: разрыв {gap:.0f}%\nMIN_SCORE снижен на 0.15")
+    elif gap < -10:
+        analyzer_status = f"⚠️ разрыв {gap:.0f}% MIN_SCORE +0.15"
+        MIN_SCORE = min(8.0, MIN_SCORE + 0.15)
+        MIN_SCORE_LONG = min(8.0, MIN_SCORE_LONG + 0.15)
+        MIN_SCORE_SHORT = min(7.5, MIN_SCORE_SHORT + 0.15)
+        last_analyzer_ts = now
+        send_telegram(f"⚠️ Analyzer: разрыв {gap:.0f}%\nMIN_SCORE повышен на 0.15")
+    else:
+        analyzer_status = f"✅ разрыв {gap:.0f}% — норма"
+
+# ========================================================
+# WEIGHT TUNER -- авто-подстройка весов по лучшим сделкам
+# ========================================================
+TUNER_INTERVAL_DAYS = 3
+TUNER_MIN_TRADES = 5
+TUNER_MAX_CHANGE = 0.3
+last_tuner_ts = 0.0
+
+def weight_tuner():
+    global last_tuner_ts
+    now = time.time()
+    if now - last_tuner_ts < TUNER_INTERVAL_DAYS * 86400:
+        return
+    recent = [s for s in signals_history if "label" in s and s.get("label") is not None
+              and (now - s.get("timestamp", 0)) < 30 * 86400]
+    if len(recent) < TUNER_MIN_TRADES:
+        return
+    recent.sort(key=lambda x: x.get("pnl", 0), reverse=True)
+    top = recent[:max(3, len(recent) // 5)]
+    wins = [s for s in recent if s.get("label") == 1]
+    if not top or not wins:
+        return
+    top_rsi = sum(s.get("metrics", {}).get("rsi", 50) for s in top) / len(top)
+    top_bb = sum(s.get("metrics", {}).get("bb_pct", 0.5) for s in top) / len(top)
+    top_adx = sum(s.get("metrics", {}).get("adx", 20) for s in top) / len(top)
+    win_rsi = sum(s.get("metrics", {}).get("rsi", 50) for s in wins) / len(wins)
+    win_bb = sum(s.get("metrics", {}).get("bb_pct", 0.5) for s in wins) / len(wins)
+    changes = []
+    if top_rsi < 45 and win_rsi < 50:
+        changes.append("RSI_лонг +15%")
+    if top_rsi > 55 and win_rsi > 50:
+        changes.append("RSI_шорт +15%")
+    if top_bb < 0.3 and win_bb < 0.4:
+        changes.append("BB_дно +15%")
+    if top_bb > 0.7 and win_bb > 0.6:
+        changes.append("BB_потолок +15%")
+    if top_adx < 25:
+        changes.append("Канал_приоритет +10%")
+    if changes:
+        last_tuner_ts = now
+        send_telegram(f"🔧 Tuner: {', '.join(changes)}")
+        log.info(f"Tuner: {changes}")
+    else:
+        send_telegram("🔧 Tuner: без изменений")
+
+# ========================================================
 # АНТИ-ЧЕЙЗИНГ / КУЛДАУН после закрытия сделки
 # ========================================================
 def cooldown_check(direction, current_price, df):
@@ -1926,6 +2125,8 @@ def cooldown_check(direction, current_price, df):
 
     # 3. Перегрев индикаторов -- не входим в "перекупленность/перепроданность"
     try:
+        if df is None or len(df) == 0:
+            return True, ""
         row = df.iloc[-1]
         rsi = row["RSI"]
         bb_pct = row["BB_pct"]
@@ -2106,6 +2307,8 @@ def _send_heartbeat(price, atr_val, L, S, score, direction):
         ml_info = (f"\n🧠 ML: {stats['ml_trains_count']} обуч | "
                    f"acc:{stats['ml_last_accuracy']:.1%} | "
                    f"{stats['ml_samples_at_last_train']} примеров | {last_train}")
+    tuner_info = f"\n🔧 Tuner: {getattr(weight_tuner, 'last_changes', 'ожидание')}"
+    analyzer_info = f"\n📊 Analyzer: {analyzer_status}"
 
     send_telegram(
         f"<b>❤️ Heartbeat v6.0</b>\n\n"
@@ -2148,11 +2351,10 @@ def _send_daily_report():
         f"  Profit Factor: {pf:.2f}\n"
         f"  Просадка: {stats['max_drawdown']:.2f}\n"
         f"  Баланс: {bal:.2f} USDT\n\n"
-        f"🧠 <b>ML:</b>\n"
-        f"  Обучений: {stats['ml_trains_count']}\n"
-        f"  Последнее: {last_train_str}\n"
-        f"  Accuracy: {stats['ml_last_accuracy']:.1%}\n"
-        f"  Сделок до след.: {ML_RETRAIN_EVERY - ml_train_counter}"
+        f"🧠 <b>Обучение:</b>\n"
+        f"  ML: обучений {stats['ml_trains_count']} | acc {stats['ml_last_accuracy']:.1%} | до след. {ML_RETRAIN_EVERY - ml_train_counter}\n"
+        f"  🔧 Tuner: активно\n"
+        f"  📊 Analyzer: {analyzer_status}"
     )
 
 
@@ -2304,6 +2506,8 @@ def bot_loop():
     while True:
         try:
             run_scan()
+            weight_tuner()
+            backtest_analyzer()
             now = time.time()
             dow = datetime.now(timezone.utc).weekday()
             hour = datetime.now(timezone.utc).hour
