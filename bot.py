@@ -2523,9 +2523,15 @@ def bot_loop():
 
     while True:
         try:
+            try:
+                weight_tuner()
+            except Exception as e:
+                log.error(f"Tuner error: {e}")
+            try:
+                backtest_analyzer()
+            except Exception as e:
+                log.error(f"Analyzer error: {e}")
             run_scan()
-            weight_tuner()
-            backtest_analyzer()
             now = time.time()
             dow = datetime.now(timezone.utc).weekday()
             hour = datetime.now(timezone.utc).hour
