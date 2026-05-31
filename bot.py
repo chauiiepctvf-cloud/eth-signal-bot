@@ -1375,6 +1375,8 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
 
     if df is None or len(df) < 50:
         return None, None, None, None, 0, "Нет данных", 0, 0, {}
+    if len(df) < 6:
+        return None, None, None, None, 0, f"Мало свечей ({len(df)})", 0, 0, {}
 
     row   = df.iloc[-1]
     price = row["close"]
@@ -1455,10 +1457,11 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
     # OBV дивергенция (исправленная логика)
     obv_div = 0
     if not np.isnan(row.get("OBV", float("nan"))) and not np.isnan(row.get("OBV_ma", float("nan"))):
-        if price > df.iloc[-5]["close"] and row["OBV"] < row["OBV_ma"]:
-            obv_div = -1
-        elif price < df.iloc[-5]["close"] and row["OBV"] > row["OBV_ma"]:
-            obv_div = 1
+        if len(df) >= 6:
+            if price > df.iloc[-5]["close"] and row["OBV"] < row["OBV_ma"]:
+                obv_div = -1
+            elif price < df.iloc[-5]["close"] and row["OBV"] > row["OBV_ma"]:
+                obv_div = 1
 
     # Перегрев цены относительно EMA21 (опасно входить на пике)
     ema21_val = row["EMA21"]
