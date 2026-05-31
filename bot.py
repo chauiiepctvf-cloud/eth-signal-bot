@@ -1704,6 +1704,21 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
         elif yesterday_high * 0.99 < price < yesterday_high:
             S += 1.0 if adx < 25 else 0.25
 
+    # Тройное касание уровня (только в канале, ADX < 25)
+    if adx < 25:
+        lows = df["low"].iloc[-20:].values
+        highs = df["high"].iloc[-20:].values
+        support_level = np.median(lows)
+        resistance_level = np.median(highs)
+        support_touches = sum(1 for l in lows if abs(l - support_level) / support_level < 0.002)
+        resistance_touches = sum(1 for h in highs if abs(h - resistance_level) / resistance_level < 0.002)
+        if support_touches >= 3:
+            L += 1.0
+            S += 1.5
+        if resistance_touches >= 3:
+            S += 1.0
+            L += 1.5
+
     # Конфлюэнция (4 из 6)
     ema_l = row["EMA9"] > row["EMA21"] > row["EMA50"]
     ema_s = row["EMA9"] < row["EMA21"] < row["EMA50"]
