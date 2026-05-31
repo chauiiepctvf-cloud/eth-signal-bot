@@ -2523,15 +2523,17 @@ def bot_loop():
 
     while True:
         try:
+            run_scan()
             try:
-                weight_tuner()
+                if time.time() - last_tuner_ts >= TUNER_INTERVAL_DAYS * 86400:
+                    threading.Thread(target=weight_tuner, daemon=True).start()
             except Exception as e:
                 log.error(f"Tuner error: {e}")
             try:
-                backtest_analyzer()
+                if time.time() - last_analyzer_ts >= 7 * 86400:
+                    threading.Thread(target=backtest_analyzer, daemon=True).start()
             except Exception as e:
                 log.error(f"Analyzer error: {e}")
-            run_scan()
             now = time.time()
             dow = datetime.now(timezone.utc).weekday()
             hour = datetime.now(timezone.utc).hour
