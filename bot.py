@@ -1919,6 +1919,7 @@ def _train_model():
     if len(done) < ML_MIN_SAMPLES:
         log.info(f"ML: мало данных ({len(done)}/{ML_MIN_SAMPLES})")
         return False
+    log.info(f"ML: начинаю обучение на {len(done)} примерах...")
 
     try:
         from sklearn.ensemble import GradientBoostingClassifier
@@ -1978,9 +1979,11 @@ def _train_model():
             f"Всего обучений: {stats['ml_trains_count']}"
         )
         storage_save_async()
+        log.info(f"ML: обучение завершено, accuracy={cv_acc:.1%}")
         return True
     except Exception as e:
-        log.error(f"train_model: {e}")
+        log.error(f"ML train_model error: {e}")
+        send_telegram(f"❌ ML обучение упало: {str(e)[:100]}")
         return False
 
 
@@ -2447,12 +2450,12 @@ def bot_loop():
              f"с метками={len(labeled)}, без меток={len(unlabeled)}, "
              f"счётчик до переобучения={ml_train_counter}/{ML_RETRAIN_EVERY}")
 
-    if len(labeled) >= ML_MIN_SAMPLES:
+    if len(labeled) >= ML_MIN_SAMPLES and stats.get("ml_trains_count", 0) == 0:
         log.info("Тренировка ML на старте...")
         if _train_model():
             ml_status_msg = (
                 f"🧠 ML обучена на {len(labeled)} сделках\n"
-                f"До следующего обучения: {ML_RETRAIN_EVERY - ml_train_counter} закрытий"
+                f"До следующего обучения: {ML_RETRAIN_EVERY - ml_train_counter} сделок"
             )
         else:
             ml_status_msg = "⚠️ ML обучение провалилось (см логи)"
