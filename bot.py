@@ -1844,12 +1844,15 @@ def run_backtest(days=30):
     if trades:
         wins = sum(1 for t in trades if t["label"] == 1)
         wr = wins / len(trades) * 100
-        send_telegram(f"📊 БЭКТЕСТ за {days} дней\nСделок: {len(trades)} | ✅ {wins} | 🔴 {len(trades)-wins}\nВинрейт: {wr:.1f}%\nДобавлено в ML с весом {BACKTEST_VIRTUAL_WEIGHT}")
+        msg = f"📊 БЭКТЕСТ за {days} дней\nСделок: {len(trades)} | ✅ {wins} | 🔴 {len(trades)-wins}\nВинрейт: {wr:.1f}%\nДобавлено в ML с весом {BACKTEST_VIRTUAL_WEIGHT}"
+        log.info(msg)
+        send_telegram(msg)
         for t in trades:
             signals_history.append(t)
         log.info(f"Бэктест: {len(trades)} сделок добавлено")
     else:
-        send_telegram(f"📊 Бэктест за {days} дней: 0 сделок")
+        log.info(f"Бэктест за {days} дней: 0 сигналов")
+        send_telegram(f"📊 Бэктест за {days} дней: 0 сигналов")
 
 # ========================================================
 # ML -- с весами по времени, feature importance
