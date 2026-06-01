@@ -2538,8 +2538,9 @@ def bot_loop():
             dow = datetime.now(timezone.utc).weekday()
             hour = datetime.now(timezone.utc).hour
             if dow == BACKTEST_AUTO_DAY and hour == BACKTEST_AUTO_HOUR:
-                if not backtest_done_initial:
+                if not globals().get("backtest_done_initial", False):
                     threading.Thread(target=run_backtest, args=(BACKTEST_DAYS_INITIAL,), daemon=True).start()
+                    global backtest_done_initial
                     backtest_done_initial = True
                 elif datetime.now(timezone.utc).minute < 10:
                     threading.Thread(target=run_backtest, args=(BACKTEST_DAYS_WEEKLY,), daemon=True).start()
