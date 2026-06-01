@@ -402,8 +402,15 @@ def storage_load_all():
     last_close_direction = data.get("last_close_direction")
     last_close_price     = data.get("last_close_price", 0.0) or 0.0
 
-    global ml_train_counter
+    global ml_train_counter, last_analyzer_ts, last_tuner_ts
+    global tuner_rsi_long_mult, tuner_rsi_short_mult, tuner_bb_long_mult, tuner_bb_short_mult
     ml_train_counter = int(data.get("ml_train_counter", 0) or 0)
+    last_analyzer_ts = float(data.get("last_analyzer_ts", 0) or 0)
+    last_tuner_ts = float(data.get("last_tuner_ts", 0) or 0)
+    tuner_rsi_long_mult = float(data.get("tuner_rsi_long_mult", 1.0) or 1.0)
+    tuner_rsi_short_mult = float(data.get("tuner_rsi_short_mult", 1.0) or 1.0)
+    tuner_bb_long_mult = float(data.get("tuner_bb_long_mult", 1.0) or 1.0)
+    tuner_bb_short_mult = float(data.get("tuner_bb_short_mult", 1.0) or 1.0)
 
     log.info(
         f"Загружено: signals={len(signals_history)} "
@@ -427,6 +434,12 @@ def storage_save_all():
             "last_close_direction": last_close_direction,
             "last_close_price":     last_close_price,
             "ml_train_counter": ml_train_counter,
+            "last_analyzer_ts": last_analyzer_ts,
+            "last_tuner_ts": last_tuner_ts,
+            "tuner_rsi_long_mult": tuner_rsi_long_mult,
+            "tuner_rsi_short_mult": tuner_rsi_short_mult,
+            "tuner_bb_long_mult": tuner_bb_long_mult,
+            "tuner_bb_short_mult": tuner_bb_short_mult,
             "last_updated":     datetime.now(timezone.utc).isoformat(),
         }
         ok = jsonbin_save(data)
