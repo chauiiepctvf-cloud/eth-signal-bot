@@ -1384,7 +1384,12 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
     atr   = row["ATR"]
     adx   = row["ADX"] if not np.isnan(row.get("ADX", float("nan"))) else 20
     # Адаптивный режим: тренд vs канал
-    if adx >= 25:
+    global current_mode
+    if current_mode == "Тренд" and adx < 23:
+        current_mode = "Канал"
+    elif current_mode == "Канал" and adx > 27:
+        current_mode = "Тренд"
+    if current_mode == "Тренд":
         current_min_score = BASE_MIN_SCORE
         sl_mult = SL_ATR_MULT
         tp_mult = TP_ATR_MULT
@@ -1499,12 +1504,12 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
 
     # 4. RSI
     if adx < 25:
-        if   rsi < 30: L += 1.0
-        elif rsi < 35: L += 0.75
-        elif rsi < 45: L += 0.5
-        elif rsi > 70: S += 1.0
-        elif rsi > 65: S += 0.75
-        elif rsi > 55: S += 0.5
+        if   rsi < 30: L += 1.0 * tuner_rsi_long_mult
+        elif rsi < 35: L += 0.75 * tuner_rsi_long_mult
+        elif rsi < 45: L += 0.5 * tuner_rsi_long_mult
+        elif rsi > 70: S += 1.0 * tuner_rsi_short_mult
+        elif rsi > 65: S += 0.75 * tuner_rsi_short_mult
+        elif rsi > 55: S += 0.5 * tuner_rsi_short_mult
     else:
         if   rsi < 35: L += 1.0
         elif rsi < 45: L += 0.5
@@ -1588,13 +1593,11 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
 
     bp = row["BB_pct"]
     if adx < 25:
-        if   bp < 0.1: L += 1.0
-        elif bp < 0.2: L += 0.75
-        elif bp > 0.9: S += 1.0
-        elif bp > 0.8: S += 0.75
-        elif 0.3 < bp < 0.7:
-            L = max(0, L - 1.0)
-            S = max(0, S - 1.0)
+        if   bp < 0.1: L += 1.0 * tuner_bb_long_mult
+        elif bp < 0.2: L += 0.75 * tuner_bb_long_mult
+        elif bp > 0.9: S += 1.0 * tuner_bb_short_mult
+        elif bp > 0.8: S += 0.75 * tuner_bb_short_mult
+        
     else:
         if   bp < 0.1: L += 0.5
         elif bp < 0.2: L += 0.25
@@ -1716,11 +1719,11 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
         support_touches = sum(1 for l in lows if abs(l - support_level) / support_level < 0.002)
         resistance_touches = sum(1 for h in highs if abs(h - resistance_level) / resistance_level < 0.002)
         if support_touches >= 3:
-            L += 1.0
-            S += 1.5
-        if resistance_touches >= 3:
-            S += 1.0
             L += 1.5
+            S += 1.0
+        if resistance_touches >= 3:
+            S += 1.5
+            L += 1.0
 
     # Конфлюэнция (4 из 6)
     ema_l = row["EMA9"] > row["EMA21"] > row["EMA50"]
@@ -2068,6 +2071,11 @@ TUNER_INTERVAL_DAYS = 3
 TUNER_MIN_TRADES = 5
 TUNER_MAX_CHANGE = 0.3
 last_tuner_ts = 0.0
+tuner_last_changes = "ожидание"
+tuner_rsi_long_mult = 1.0
+tuner_rsi_short_mult = 1.0
+tuner_bb_long_mult = 1.0
+tuner_bb_short_mult = 1.0
 
 def weight_tuner():
     global last_tuner_ts
@@ -2089,14 +2097,19 @@ def weight_tuner():
     win_rsi = sum(s.get("metrics", {}).get("rsi", 50) for s in wins) / len(wins)
     win_bb = sum(s.get("metrics", {}).get("bb_pct", 0.5) for s in wins) / len(wins)
     changes = []
+    global tuner_rsi_long_mult, tuner_rsi_short_mult, tuner_bb_long_mult, tuner_bb_short_mult
     if top_rsi < 45 and win_rsi < 50:
-        changes.append("RSI_лонг +15%")
+        tuner_rsi_long_mult = min(1.5, tuner_rsi_long_mult + 0.15)
+        changes.append(f"RSI_лонг ×{tuner_rsi_long_mult:.2f}")
     if top_rsi > 55 and win_rsi > 50:
-        changes.append("RSI_шорт +15%")
+        tuner_rsi_short_mult = min(1.5, tuner_rsi_short_mult + 0.15)
+        changes.append(f"RSI_шорт ×{tuner_rsi_short_mult:.2f}")
     if top_bb < 0.3 and win_bb < 0.4:
-        changes.append("BB_дно +15%")
+        tuner_bb_long_mult = min(1.5, tuner_bb_long_mult + 0.15)
+        changes.append(f"BB_дно ×{tuner_bb_long_mult:.2f}")
     if top_bb > 0.7 and win_bb > 0.6:
-        changes.append("BB_потолок +15%")
+        tuner_bb_short_mult = min(1.5, tuner_bb_short_mult + 0.15)
+        changes.append(f"BB_потолок ×{tuner_bb_short_mult:.2f}")
     if top_adx < 25:
         changes.append("Канал_приоритет +10%")
     if changes:
@@ -2544,12 +2557,12 @@ def bot_loop():
             dow = datetime.now(timezone.utc).weekday()
             hour = datetime.now(timezone.utc).hour
             if dow == BACKTEST_AUTO_DAY and hour == BACKTEST_AUTO_HOUR:
-                if not globals().get("backtest_done_initial", False):
-                    threading.Thread(target=run_backtest, args=(BACKTEST_DAYS_INITIAL,), daemon=True).start()
-                    global backtest_done_initial
-                    backtest_done_initial = True
-                elif datetime.now(timezone.utc).minute < 10:
-                    threading.Thread(target=run_backtest, args=(BACKTEST_DAYS_WEEKLY,), daemon=True).start()
+                if stats["total"] >= 50:
+                    if not backtest_done_initial:
+                        threading.Thread(target=run_backtest, args=(BACKTEST_DAYS_INITIAL,), daemon=True).start()
+                        backtest_done_initial = True
+                    elif datetime.now(timezone.utc).minute < 10:
+                        threading.Thread(target=run_backtest, args=(BACKTEST_DAYS_WEEKLY,), daemon=True).start()
         except Exception as e:
             log.error(f"run_scan: {e}")
             send_telegram(f"⚠️ Ошибка скана: {e}")
