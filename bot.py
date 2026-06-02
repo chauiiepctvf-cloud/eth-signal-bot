@@ -158,7 +158,11 @@ ANTI_CHASE_WINDOW   = 30 * 60
 RSI_OVERHEAT_LONG   = 75
 RSI_OVERHEAT_SHORT  = 25
 BB_OVERHEAT_LONG    = 0.95
-BB_OVERHEAT_SHORT   = 0.25
+BB_OVERHEAT_SHORT   = 0.5
+
+# Безубыток после TP1 (v6.5): стоп переезжает на entry +/- этот буфер,
+# чтобы покрыть тейкерскую комиссию обеих сторон (~0.05% x2 = 0.1%) и гарантировать неотрицательный итог.
+BREAKEVEN_FEE_PCT   = 0.0012   # 0.12% запас за вход (в сторону прибыли)
 
 # ML
 ML_RETRAIN_EVERY= 10
@@ -636,12 +640,9 @@ def okx_place_order(direction, entry, sl, tp, atr_val=0.0):
             break
         time.sleep(1)
 
-    # TP1: 50% позиции на 1.5 ATR (ФИКС v6.4: atr берём из аргумента)
-    if atr_val and atr_val > 0:
-        tp1_dist = atr_val * 1.5
-    else:
-        tp1_dist = abs(entry - sl) * 0.5
-    tp1_price = round(entry + tp1_dist, 2) if direction == "LONG" else round(entry - tp1_dist, 2)
+    # TP1: 50% позиции на ПОЛПУТИ между входом и основным TP (v6.5)
+    # При исполнении TP1 стоп переедет в БУ+комиссия (см. _check_tp1_breakeven).
+    tp1_price = round((entry + tp) / 2, 2)
     tp1_qty = total_qty // 2
     tp1_algo_id = None
 
@@ -710,7 +711,9 @@ def okx_place_order(direction, entry, sl, tp, atr_val=0.0):
         "entry":      entry,
         "sl":         sl,
         "tp":         tp,
+        "tp1_price":  tp1_price,
         "total_qty":  total_qty,
+        "tp1_qty":    tp1_qty,
         "pos_side":   pos_side,
         "cls_side":   cls_side,
         "open_time":  time.time(),
@@ -720,6 +723,8 @@ def okx_place_order(direction, entry, sl, tp, atr_val=0.0):
         "sl_ok":      sl_algo_id is not None,
         "tp_ok":      tp_algo_id is not None,
         "tp1_ok":     tp1_algo_id is not None,
+        "tp1_filled": False,
+        "be_moved":   False,
     }
     storage_save_async()
 
@@ -744,9 +749,12 @@ def check_closed_positions():
     try:
         current = okx_get_positions()
         open_sides = set()
+        pos_qty_by_side = {}   # текущий объём позиции по стороне (для детекта TP1)
         for p in current:
             if abs(float(p.get("pos", 0))) > 0:
-                open_sides.add(p.get("posSide"))
+                ps = p.get("posSide")
+                open_sides.add(ps)
+                pos_qty_by_side[ps] = abs(float(p.get("pos", 0)))
 
         now = time.time()
 
@@ -780,6 +788,9 @@ def check_closed_positions():
                 continue
 
             if pos.get("pos_side") in open_sides:
+                # Позиция ещё жива -> проверяем, не исполнился ли TP1 (перевод стопа в БУ)
+                cur_qty = pos_qty_by_side.get(pos.get("pos_side"), 0)
+                _check_tp1_breakeven(order_id, pos, cur_qty)
                 continue
 
             _handle_position_close(order_id, pos)
@@ -787,6 +798,68 @@ def check_closed_positions():
     except Exception as e:
         log.error(f"check_closed_positions: {e}")
 
+
+def _check_tp1_breakeven(order_id, pos, cur_qty):
+    """Если TP1 исполнился (объём позиции упал примерно вдвое), переводит стоп
+    в безубыток + комиссия на оставшийся объём. v6.5."""
+    if pos.get("be_moved"):
+        return
+    total_qty = pos.get("total_qty", 0)
+    tp1_qty   = pos.get("tp1_qty", total_qty // 2)
+    if total_qty <= 0 or cur_qty <= 0:
+        return
+
+    # TP1 считается исполненным, если ушла как минимум половина объёма.
+    remaining_after_tp1 = total_qty - tp1_qty
+    if cur_qty > remaining_after_tp1 + max(1, int(total_qty * 0.05)):
+        return  # объём ещё полный -> TP1 не сработал
+
+    direction = pos["direction"]
+    entry     = pos["entry"]
+    cls_side  = pos["cls_side"]
+    pos_side  = pos["pos_side"]
+
+    # Новый стоп: БУ + комиссия в сторону прибыли
+    if direction == "LONG":
+        be_px = round(entry * (1 + BREAKEVEN_FEE_PCT), 2)
+    else:
+        be_px = round(entry * (1 - BREAKEVEN_FEE_PCT), 2)
+
+    # Отменяем старый SL и ставим новый на текущий остаток
+    okx_cancel_algo(pos.get("sl_algo_id"))
+    new_sl_id = None
+    for _ in range(3):
+        r = okx_post("/api/v5/trade/order-algo", {
+            "instId":   SYMBOL,
+            "tdMode":   "cross",
+            "side":     cls_side,
+            "posSide":  pos_side,
+            "ordType":  "conditional",
+            "sz":       str(int(cur_qty)),
+            "slTriggerPx":     str(be_px),
+            "slOrdPx":         "-1",
+            "slTriggerPxType": "last",
+        })
+        if r.get("code") == "0":
+            new_sl_id = r["data"][0].get("algoId", "")
+            break
+        time.sleep(1)
+
+    pos["tp1_filled"] = True
+    pos["be_moved"] = True
+    pos["sl"] = be_px
+    pos["sl_algo_id"] = new_sl_id
+    pos["total_qty"] = int(cur_qty)
+    storage_save_async()
+
+    log.info(f"TP1 исполнен ({order_id}): стоп -> БУ {be_px:.2f}, остаток {int(cur_qty)}")
+    send_telegram(
+        f"🎯 <b>TP1 ИСПОЛНЕН (50%)</b>\n"
+        f"{direction} | зафиксирована половина\n"
+        f"🛡 Стоп переведён в безубыток: {be_px:.2f}\n"
+        f"Остаток {int(cur_qty)} контр. работает до TP2 {pos.get('tp', 0):.2f}\n"
+        f"{'✅ SL переставлен' if new_sl_id else '⚠️ SL НЕ переставился — проверь вручную!'}"
+    )
 
 def _handle_position_close(order_id, pos):
     global losses_in_row, MIN_SCORE
