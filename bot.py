@@ -920,6 +920,11 @@ def get_klines(sym, interval, limit=150):
     try:
         url = f"https://api.binance.com/api/v3/klines?symbol={sym}&interval={interval}&limit={limit}"
         data = requests.get(url, timeout=10).json()
+        # Binance при троттлинге/ошибке отдаёт dict ({"code":...}) или пустой список,
+        # а не массив свечей. Защищаемся, иначе df.iloc[-1] упадёт out-of-bounds.
+        if not isinstance(data, list) or len(data) == 0:
+            log.warning(f"klines {sym} {interval}: пустой/битый ответ ({str(data)[:120]})")
+            return None
         df = pd.DataFrame(data, columns=[
             "time", "open", "high", "low", "close", "volume",
             "ct", "qv", "trades", "taker_buy_base", "tbq", "ignore",
@@ -2217,8 +2222,8 @@ def run_scan():
         yesterday_high, yesterday_low = get_yesterday_levels()
 
     df = get_klines(SYMBOL_BN, TIMEFRAME, 200)
-    if df is None:
-        send_telegram("❌ Ошибка получения свечей")
+    if df is None or len(df) < 50:
+        log.warning(f"Свечей мало или нет ({0 if df is None else len(df)}) -- пропускаю скан")
         return
     df = calc(df)
 
