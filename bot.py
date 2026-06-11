@@ -1,21 +1,17 @@
 """
-OKX Scalp Bot v6.4 (ETH-USDT-SWAP)
+OKX Scalp Bot v6.6 (ETH-USDT-SWAP)
 Многофакторный скальпинг с ML-обучением
 Адаптивный режим тренд/канал | Weight Tuner | Backtest Analyzer
 
-Изменения v6.4 (по сравнению с v6.3):
-* ФИКС: тройное касание -- поддержка даёт бонус ТОЛЬКО лонгу, сопротивление ТОЛЬКО шорту
-* ФИКС: TP1 теперь считается от настоящего ATR (передаётся из сигнала), а не от мусора volume-close
-* ФИКС: режим Тренд/Канал и секции RSI/BB привязаны к ОДНОМУ current_mode (убран рассинхрон 23/27 vs 25)
-* ФИКС: гистерезис ADX расширен до 20/30 (меньше дёрганья на границе)
-* ФИКС: Weight Tuner шаг +0.05 + затухание к 1.0 (убран однонаправленный дрейф)
-* ФИКС: race condition в бэктесте -- работает на копии кэша, не замораживает глобальный
-* ФИКС: losses_in_row растёт только на реальном убытке, не на сбое размещения ордера
-* ФИКС: 1h-подтверждение вынесено в лёгкую функцию (без повторных вызовов внешних API)
-* ФИКС: MIN_SCORE_LONG/SHORT и force_test_done переживают рестарт
-* ФИКС: weight_tuner.last_changes реально присваивается (heartbeat больше не врёт)
-* ФИКС: единый флаг LIVE для переключения демо/прод
-* ФИКС: версии в сообщениях приведены к v6.4
+Изменения v6.6 (по сравнению с v6.4/6.5):
+* Запросы к Binance урезаны: кэш btc_momentum(60с), confirm_1h_bias(5мин), batch-тикеры, dominance 30мин, fear&greed/4h 2ч
+* Канал: штраф за середину (BB% 0.4-0.6), круглые уровни, BB squeeze, бонус в Азию (0-8 UTC)
+* Тройное касание: 2-3 бонус, 4+ слабее (истощение уровня)
+* Time-stop закрывает позицию ТОЛЬКО в плюсе, в минусе ждёт SL
+* TP1 на полпути -> стоп в БУ+комиссия при исполнении (v6.5), sweep осиротевших алго
+* ML: время-триггер (>48ч и >=3 новых сделок), decay 7->5 дней
+* Бэктест: _backtest_mode вместо заморозки кэша (нет look-ahead на сегодняшние макро)
+* Tuner/Analyzer: last_ts ставится при раннем выходе (не дёргаются каждый скан)
 """
 
 import os
@@ -46,7 +42,7 @@ JSONBIN_KEY     = os.environ.get("JSONBIN_API_KEY")
 JSONBIN_BIN_ID  = os.environ.get("JSONBIN_BIN_ID")
 
 # ЕДИНЫЙ ФЛАГ боевой/демо. LIVE=False -> демо (x-simulated-trading:1).
-# Для боя поставь env OKX_LIVE=1.
+# Для боя поставь LIVE = True (или env OKX_LIVE=1).
 LIVE = os.environ.get("OKX_LIVE", "0") == "1"
 
 OKX_BASE        = "https://www.okx.com"
@@ -167,7 +163,7 @@ BREAKEVEN_FEE_PCT   = 0.0012   # 0.12% запас за вход (в сторон
 # ML
 ML_RETRAIN_EVERY= 10
 ML_MIN_SAMPLES  = 30
-ML_DECAY_DAYS   = 7
+ML_DECAY_DAYS   = 5      # v6.6: быстрее забываем старое (рынок меняется)
 
 FORCE_TEST      = False
 
@@ -297,6 +293,7 @@ ml_train_counter = 0
 last_vwap_reset_day = -1
 analyzer_status = "норма"
 current_mode = "Тренд"
+_backtest_mode = False   # v6.6: True во время run_backtest -> get_signal не ходит в сеть
 
 # Tuner-состояние (объявлено ДО первого использования)
 last_analyzer_ts = 0.0
@@ -325,6 +322,9 @@ cache = {
     "1h_trend":       {"price_vs_ema": 0.0, "bull": True, "ts": 0},
     "whales":         {"detected": False, "ts": 0},
     "eth_btc_corr":   {"value": 1.0, "ts": 0},
+    "btc_mom":        {"chg": 0.0, "dir": 0, "ts": 0},
+    "bias_1h":        {"value": None, "ts": 0},
+    "tickers":        {"eth": 0.0, "btc": 0.0, "eth_cb": 0.0, "ts": 0},
 }
 
 
@@ -569,6 +569,25 @@ def okx_get_fills_history(begin_ms):
     })
 
 
+def okx_cancel_all_algos():
+    """v6.6: отменяет ВСЕ живые алго-ордера (SL/TP) по инструменту.
+    Защита от 'осиротевших' ордеров после рестартов/частичных закрытий."""
+    try:
+        r = okx_get("/api/v5/trade/orders-algo-pending", {
+            "instId": SYMBOL, "ordType": "conditional",
+        })
+        algos = r.get("data", [])
+        if not algos:
+            return
+        batch = [{"instId": SYMBOL, "algoId": a.get("algoId")}
+                 for a in algos if a.get("algoId")]
+        if batch:
+            okx_post("/api/v5/trade/cancel-algos", batch)
+            log.info(f"Отменено осиротевших алго: {len(batch)}")
+    except Exception as e:
+        log.error(f"cancel_all_algos: {e}")
+
+
 def okx_place_order(direction, entry, sl, tp, atr_val=0.0):
     """Открывает позицию + ставит SL и TP. atr_val передаётся из сигнала
     (ФИКС v6.4: раньше TP1 считался от мусора volume-close через 2 лишних HTTP)."""
@@ -723,8 +742,8 @@ def okx_place_order(direction, entry, sl, tp, atr_val=0.0):
         "sl_ok":      sl_algo_id is not None,
         "tp_ok":      tp_algo_id is not None,
         "tp1_ok":     tp1_algo_id is not None,
-        "tp1_filled": False,
-        "be_moved":   False,
+        "tp1_filled": False,   # стал True когда TP1 исполнился
+        "be_moved":   False,   # стоп переведён в безубыток
     }
     storage_save_async()
 
@@ -750,11 +769,16 @@ def check_closed_positions():
         current = okx_get_positions()
         open_sides = set()
         pos_qty_by_side = {}   # текущий объём позиции по стороне (для детекта TP1)
+        pos_px_by_side = {}    # markPx позиции (для time-stop "только в плюс")
         for p in current:
             if abs(float(p.get("pos", 0))) > 0:
                 ps = p.get("posSide")
                 open_sides.add(ps)
                 pos_qty_by_side[ps] = abs(float(p.get("pos", 0)))
+                try:
+                    pos_px_by_side[ps] = float(p.get("markPx") or p.get("last") or 0)
+                except Exception:
+                    pos_px_by_side[ps] = 0.0
 
         now = time.time()
 
@@ -766,11 +790,32 @@ def check_closed_positions():
             age_hrs = (now - pos.get("open_time", now)) / 3600
             if (pos.get("pos_side") in open_sides
                 and age_hrs > MAX_HOLD_HOURS):
-                log.warning(f"Time-stop: {order_id} висит {age_hrs:.1f}ч > {MAX_HOLD_HOURS}ч -- закрываю")
+                # v6.6: закрываем по времени ТОЛЬКО если позиция в плюсе.
+                # В минусе — оставляем работать до SL (не фиксируем убыток принудительно).
+                ps = pos.get("pos_side")
+                cur_px = pos_px_by_side.get(ps, 0.0)
+                entry_px = pos.get("entry", 0.0)
+                in_profit = False
+                if cur_px > 0 and entry_px > 0:
+                    if pos["direction"] == "LONG":
+                        in_profit = cur_px > entry_px * (1 + BREAKEVEN_FEE_PCT)
+                    else:
+                        in_profit = cur_px < entry_px * (1 - BREAKEVEN_FEE_PCT)
+
+                if not in_profit:
+                    # Не трогаем — пусть SL отработает. Лог раз в ~час, чтобы не спамить.
+                    if int(age_hrs * 60) % 60 == 0:
+                        log.info(f"Time-stop пропущен: {order_id} висит {age_hrs:.1f}ч, но в минусе — ждём SL")
+                    # проверим БУ на всякий и идём дальше
+                    cur_qty = pos_qty_by_side.get(ps, 0)
+                    _check_tp1_breakeven(order_id, pos, cur_qty)
+                    continue
+
+                log.warning(f"Time-stop: {order_id} висит {age_hrs:.1f}ч > {MAX_HOLD_HOURS}ч, в плюсе -- закрываю")
                 send_telegram(
-                    f"⏱ <b>TIME-STOP</b>\n"
+                    f"⏱ <b>TIME-STOP (в плюсе)</b>\n"
                     f"Позиция {pos['direction']} висит {age_hrs:.1f}ч\n"
-                    f"Принудительное закрытие по рынку"
+                    f"Закрытие по рынку с прибылью"
                 )
                 okx_cancel_algo(pos.get("sl_algo_id"))
                 okx_cancel_algo(pos.get("tp_algo_id"))
@@ -809,7 +854,8 @@ def _check_tp1_breakeven(order_id, pos, cur_qty):
     if total_qty <= 0 or cur_qty <= 0:
         return
 
-    # TP1 считается исполненным, если ушла как минимум половина объёма.
+    # TP1 считается исполненным, если осталось <= (total - tp1_qty) + небольшой допуск,
+    # т.е. ушла как минимум половина.
     remaining_after_tp1 = total_qty - tp1_qty
     if cur_qty > remaining_after_tp1 + max(1, int(total_qty * 0.05)):
         return  # объём ещё полный -> TP1 не сработал
@@ -849,7 +895,7 @@ def _check_tp1_breakeven(order_id, pos, cur_qty):
     pos["be_moved"] = True
     pos["sl"] = be_px
     pos["sl_algo_id"] = new_sl_id
-    pos["total_qty"] = int(cur_qty)
+    pos["total_qty"] = int(cur_qty)   # дальше работаем с остатком
     storage_save_async()
 
     log.info(f"TP1 исполнен ({order_id}): стоп -> БУ {be_px:.2f}, остаток {int(cur_qty)}")
@@ -860,6 +906,7 @@ def _check_tp1_breakeven(order_id, pos, cur_qty):
         f"Остаток {int(cur_qty)} контр. работает до TP2 {pos.get('tp', 0):.2f}\n"
         f"{'✅ SL переставлен' if new_sl_id else '⚠️ SL НЕ переставился — проверь вручную!'}"
     )
+
 
 def _handle_position_close(order_id, pos):
     global losses_in_row, MIN_SCORE
@@ -916,6 +963,7 @@ def _handle_position_close(order_id, pos):
     okx_cancel_algo(pos.get("sl_algo_id"))
     okx_cancel_algo(pos.get("tp_algo_id"))
     okx_cancel_algo(pos.get("tp1_algo_id"))
+    okx_cancel_all_algos()  # v6.6: добиваем осиротевшие алго по инструменту
 
     is_win = pnl_usdt > 0
     _update_stats(pnl_usdt, is_win)
@@ -1043,12 +1091,17 @@ def get_orderbook():
 
 
 def get_btc_momentum():
+    # v6.6: кэш 60с (раньше klines каждый скан)
+    now = time.time()
+    if now - cache["btc_mom"]["ts"] < 60:
+        return cache["btc_mom"]["chg"], cache["btc_mom"]["dir"]
     try:
         df = get_klines(BTC_SYMBOL, "3m", 5)
         if df is None or len(df) < 3:
             return 0.0, 0
         chg = (df.iloc[-1]["close"] - df.iloc[-3]["close"]) / df.iloc[-3]["close"]
         btc_dir = 1 if df.iloc[-1]["close"] > df.iloc[-2]["close"] else -1
+        cache["btc_mom"] = {"chg": round(chg, 4), "dir": btc_dir, "ts": now}
         return round(chg, 4), btc_dir
     except Exception:
         return 0.0, 0
@@ -1067,7 +1120,7 @@ def get_yesterday_levels():
 
 def get_fear_greed():
     now = time.time()
-    if now - cache["fear_greed"]["ts"] < 3600:
+    if now - cache["fear_greed"]["ts"] < 7200:  # v6.6 2ч
         return cache["fear_greed"]["value"]
     try:
         v = int(requests.get("https://api.alternative.me/fng/?limit=1", timeout=10).json()
@@ -1175,7 +1228,7 @@ def _coingecko_global():
 
 def get_usdt_dominance():
     now = time.time()
-    if now - cache["usdt_dom"]["ts"] < 600:
+    if now - cache["usdt_dom"]["ts"] < 1800:  # v6.6 30мин
         return cache["usdt_dom"]["value"], cache["usdt_dom"]["change"]
     try:
         v = float(_coingecko_global()["market_cap_percentage"]["usdt"])
@@ -1189,7 +1242,7 @@ def get_usdt_dominance():
 
 def get_btc_dominance():
     now = time.time()
-    if now - cache["btc_dom"]["ts"] < 600:
+    if now - cache["btc_dom"]["ts"] < 1800:  # v6.6 30мин
         return cache["btc_dom"]["value"], cache["btc_dom"]["change"]
     try:
         v = float(_coingecko_global()["market_cap_percentage"]["btc"])
@@ -1201,18 +1254,43 @@ def get_btc_dominance():
         return 50, 0
 
 
+def _get_tickers():
+    """v6.6: ОДИН batch-запрос Binance на все цены сразу + 1 Coinbase.
+    Раньше eth_btc_ratio и cb_premium делали 4 отдельных запроса. Кэш 60с."""
+    now = time.time()
+    if now - cache["tickers"]["ts"] < 60:
+        t = cache["tickers"]
+        return t["eth"], t["btc"], t["eth_cb"]
+    eth = btc = eth_cb = 0.0
+    try:
+        # batch: один запрос на оба символа Binance
+        arr = requests.get(
+            'https://api.binance.com/api/v3/ticker/price?symbols=["ETHUSDT","BTCUSDT"]',
+            timeout=8).json()
+        for it in arr:
+            if it.get("symbol") == "ETHUSDT": eth = float(it["price"])
+            elif it.get("symbol") == "BTCUSDT": btc = float(it["price"])
+    except Exception:
+        pass
+    try:
+        eth_cb = float(requests.get(
+            "https://api.exchange.coinbase.com/products/ETH-USD/ticker",
+            timeout=8).json()["price"])
+    except Exception:
+        pass
+    cache["tickers"] = {"eth": eth, "btc": btc, "eth_cb": eth_cb, "ts": now}
+    return eth, btc, eth_cb
+
+
 def get_coinbase_premium():
     now = time.time()
     if now - cache["cb_premium"]["ts"] < 60:
         return cache["cb_premium"]["value"]
     try:
-        cb = float(requests.get(
-            "https://api.exchange.coinbase.com/products/ETH-USD/ticker",
-            timeout=8).json()["price"])
-        bn = float(requests.get(
-            f"https://api.binance.com/api/v3/ticker/price?symbol={SYMBOL_BN}",
-            timeout=8).json()["price"])
-        p = round((cb - bn) / bn * 100, 4)
+        eth, _, eth_cb = _get_tickers()
+        if eth <= 0 or eth_cb <= 0:
+            return cache["cb_premium"]["value"]
+        p = round((eth_cb - eth) / eth * 100, 4)
         cache["cb_premium"] = {"value": p, "ts": now}
         return p
     except Exception:
@@ -1224,10 +1302,7 @@ def get_eth_btc_ratio():
     if now - cache["eth_btc"]["ts"] < 300:
         return cache["eth_btc"]["value"], cache["eth_btc"]["change"]
     try:
-        eth = float(requests.get(
-            "https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT", timeout=8).json()["price"])
-        btc = float(requests.get(
-            "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=8).json()["price"])
+        eth, btc, _ = _get_tickers()
         ratio = eth / btc if btc > 0 else 0.0
         prev = cache["eth_btc"]["value"]
         chg = ((ratio - prev) / prev * 100) if prev > 0 else 0.0
@@ -1261,7 +1336,7 @@ def get_funding_avg():
 
 def get_4h_trend():
     now = time.time()
-    if now - cache["4h_trend"]["ts"] < 3600:
+    if now - cache["4h_trend"]["ts"] < 7200:  # v6.6: 2ч (4h-тренд меняется медленно)
         return cache["4h_trend"]["diff"], cache["4h_trend"]["bull"]
     try:
         df = get_klines(SYMBOL_BN, "4h", 200)
@@ -1416,25 +1491,39 @@ def calc(df):
 
 def confirm_1h_bias():
     """Лёгкое 1h-подтверждение: ТОЛЬКО EMA/RSI/MACD по 1h-свечам.
-    ФИКС v6.4: заменяет рекурсивный get_signal(df_1h), который повторно
-    дёргал все внешние API каждый скан. Возвращает 'LONG'/'SHORT'/None."""
+    v6.6: кэш 5 мин + считаем только нужные индикаторы (не полный calc),
+    чтобы не дёргать klines(1h) и не гонять тяжёлый calc каждый скан."""
+    now = time.time()
+    if now - cache["bias_1h"]["ts"] < 300:
+        return cache["bias_1h"]["value"]
     try:
-        df = get_klines(SYMBOL_BN, "1h", 100)
+        df = get_klines(SYMBOL_BN, "1h", 60)
         if df is None or len(df) < 50:
             return None
-        df = calc(df)
-        row = df.iloc[-1]
-        ema_bull = row["EMA9"] > row["EMA21"] > row["EMA50"]
-        ema_bear = row["EMA9"] < row["EMA21"] < row["EMA50"]
-        macd_bull = row["MACD"] > row["MACD_sig"]
-        rsi = row["RSI"]
+        c = df["close"]
+        ema9  = c.ewm(span=9, adjust=False).mean().iloc[-1]
+        ema21 = c.ewm(span=21, adjust=False).mean().iloc[-1]
+        ema50 = c.ewm(span=50, adjust=False).mean().iloc[-1]
+        e12 = c.ewm(span=12, adjust=False).mean()
+        e26 = c.ewm(span=26, adjust=False).mean()
+        macd = (e12 - e26)
+        macd_sig = macd.ewm(span=9, adjust=False).mean()
+        macd_bull = macd.iloc[-1] > macd_sig.iloc[-1]
+        d = c.diff()
+        gain = d.clip(lower=0).ewm(com=13, adjust=False).mean()
+        loss = (-d.clip(upper=0)).ewm(com=13, adjust=False).mean()
+        rsi = (100 - 100 / (1 + gain / loss.replace(0, np.nan))).iloc[-1]
+        ema_bull = ema9 > ema21 > ema50
+        ema_bear = ema9 < ema21 < ema50
         long_votes  = sum([ema_bull, macd_bull, rsi < 50])
         short_votes = sum([ema_bear, not macd_bull, rsi > 50])
+        res = None
         if long_votes >= 2 and ema_bull:
-            return "LONG"
-        if short_votes >= 2 and ema_bear:
-            return "SHORT"
-        return None
+            res = "LONG"
+        elif short_votes >= 2 and ema_bear:
+            res = "SHORT"
+        cache["bias_1h"] = {"value": res, "ts": now}
+        return res
     except Exception as e:
         log.error(f"confirm_1h_bias: {e}")
         return None
@@ -1497,9 +1586,10 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
     if sec_since_candle < 30:
         return None, None, None, None, 0, f"Свеча свежая ({int(sec_since_candle)}с)", 0, 0, {}
 
-    corr = get_eth_btc_correlation()
-    if corr < ETH_BTC_CORR_MIN:
-        return None, None, None, None, 0, f"Корреляция {corr:.2f}", 0, 0, {}
+    if not _backtest_mode:
+        corr = get_eth_btc_correlation()
+        if corr < ETH_BTC_CORR_MIN:
+            return None, None, None, None, 0, f"Корреляция {corr:.2f}", 0, 0, {}
 
     if FORCE_TEST and not force_test_done:
         force_test_done = True
@@ -1518,19 +1608,35 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
     last_ob = ob
 
     # Метрики
-    fear_greed   = get_fear_greed()
-    long_short   = get_long_short_ratio()
-    taker_ratio  = get_taker_ratio()
-    oi, oi_chg   = get_open_interest()
-    dxy, dxy_chg = get_dxy()
-    vix          = get_vix()
-    _, usdt_chg  = get_usdt_dominance()
-    cb_premium   = get_coinbase_premium()
-    _, eth_btc_c = get_eth_btc_ratio()
-    funding_avg  = get_funding_avg()
-    _, btc_dom_c = get_btc_dominance()
-    ema_4h_diff, ema_4h_bull = get_4h_trend()
-    p_vs_1h, trend_1h_bull   = get_1h_trend()
+    if _backtest_mode:
+        # v6.6: в бэктесте внешние метрики НЕДОСТУПНЫ исторически (был бы look-ahead
+        # на сегодняшние макро). Ставим нейтраль -> сигнал считается ТОЛЬКО по свечам.
+        fear_greed = 50; long_short = 1.0; taker_ratio = 1.0
+        oi_chg = 0; dxy_chg = 0; vix = 20; usdt_chg = 0
+        cb_premium = 0.0; eth_btc_c = 0.0; funding_avg = 0.0; btc_dom_c = 0.0
+        # 4h/1h тренд считаем по самим свечам df (это не look-ahead — данные из окна)
+        try:
+            e50 = df["close"].ewm(span=50, adjust=False).mean().iloc[-1]
+            e200 = df["close"].ewm(span=200, adjust=False).mean().iloc[-1]
+            ema_4h_diff = (e50 - e200) / e200 * 100 if e200 else 0.0
+            ema_4h_bull = e50 > e200
+        except Exception:
+            ema_4h_diff, ema_4h_bull = 0.0, True
+        p_vs_1h, trend_1h_bull = 0.0, ema_4h_bull
+    else:
+        fear_greed   = get_fear_greed()
+        long_short   = get_long_short_ratio()
+        taker_ratio  = get_taker_ratio()
+        oi, oi_chg   = get_open_interest()
+        dxy, dxy_chg = get_dxy()
+        vix          = get_vix()
+        _, usdt_chg  = get_usdt_dominance()
+        cb_premium   = get_coinbase_premium()
+        _, eth_btc_c = get_eth_btc_ratio()
+        funding_avg  = get_funding_avg()
+        _, btc_dom_c = get_btc_dominance()
+        ema_4h_diff, ema_4h_bull = get_4h_trend()
+        p_vs_1h, trend_1h_bull   = get_1h_trend()
 
     obv_div = 0
     if not np.isnan(row.get("OBV", float("nan"))) and not np.isnan(row.get("OBV_ma", float("nan"))):
@@ -1666,6 +1772,17 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
         elif bp < 0.2: L += 0.75 * tuner_bb_long_mult
         elif bp > 0.9: S += 1.0 * tuner_bb_short_mult
         elif bp > 0.8: S += 0.75 * tuner_bb_short_mult
+        # v6.6: ШТРАФ за середину канала (0.4-0.6) — худшее место для входа,
+        # до обеих границ далеко, RR плохой, чистый шум.
+        elif 0.4 <= bp <= 0.6:
+            L = max(0, L - 1.0)
+            S = max(0, S - 1.0)
+        # v6.6: BB squeeze — сжатие полос = затишье перед движением.
+        # Ширина полос относительно цены; узко = бонус стороне у границы.
+        bb_width = (row["BB_up"] - row["BB_dn"]) / price if price > 0 else 1.0
+        if bb_width < 0.015:  # полосы уже 1.5% — сильное сжатие
+            if bp < 0.25:   L += 0.5
+            elif bp > 0.75: S += 0.5
     else:
         if   bp < 0.1: L += 0.5
         elif bp < 0.2: L += 0.25
@@ -1730,7 +1847,7 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
             pass
 
     # Подтверждение по 1h (ФИКС v6.4: лёгкая функция вместо рекурсии get_signal)
-    bias_1h = confirm_1h_bias()
+    bias_1h = None if _backtest_mode else confirm_1h_bias()
     if bias_1h == "LONG":
         L += 0.5
     elif bias_1h == "SHORT":
@@ -1765,7 +1882,7 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
             S += 1.0 if is_channel else 0.25
 
     # Тройное касание уровня (ФИКС v6.4: поддержка -> ТОЛЬКО лонг,
-    # сопротивление -> ТОЛЬКО шорт. Убраны встречные бонусы.)
+    # сопротивление -> ТОЛЬКО шорт. v6.6: 2-3 касания бонус, 4+ слабее — уровень "истощается").
     if is_channel:
         lows = df["low"].iloc[-20:].values
         highs = df["high"].iloc[-20:].values
@@ -1773,10 +1890,30 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
         resistance_level = np.median(highs)
         support_touches = sum(1 for l in lows if abs(l - support_level) / support_level < 0.002)
         resistance_touches = sum(1 for h in highs if abs(h - resistance_level) / resistance_level < 0.002)
-        if support_touches >= 3:
+        if support_touches >= 4:
+            L += 0.75   # истощение — риск пробоя
+        elif support_touches >= 2:
             L += 1.5
-        if resistance_touches >= 3:
+        if resistance_touches >= 4:
+            S += 0.75
+        elif resistance_touches >= 2:
             S += 1.5
+
+        # v6.6: КРУГЛЫЕ УРОВНИ — магниты ликвидности (1900/1950/2000...).
+        # Цена у круглого уровня снизу -> поддержка (лонг); сверху -> сопротивление (шорт).
+        nearest_50 = round(price / 50) * 50
+        dist_round = abs(price - nearest_50) / price
+        if dist_round < 0.0015:  # в пределах 0.15% от уровня кратного 50
+            if price >= nearest_50:   # уровень снизу держит
+                L += 0.5
+            else:                     # уровень сверху давит
+                S += 0.5
+
+    # v6.6: АЗИАТСКАЯ СЕССИЯ (00:00-08:00 UTC) — низковолатильный рейндж,
+    # канал работает лучше тренда. Небольшой бонус каналу.
+    if is_channel and 0 <= hour < 8:
+        if L > S: L += 0.5
+        elif S > L: S += 0.5
 
     # Конфлюэнция (4 из 6)
     ema_l = row["EMA9"] > row["EMA21"] > row["EMA50"]
@@ -1858,14 +1995,11 @@ def run_backtest(days=30):
             return
         df = calc(df)
 
-        # ФИКС: сохраняем кэш и СТАВИМ свежие ts, чтобы геттеры брали из кэша
-        # и не ходили в сеть. Главный поток продолжает читать реальные значения,
-        # мы НЕ ставим inf и восстанавливаем кэш в finally.
-        global cache
-        cache_backup = {k: dict(v) for k, v in cache.items()}
-        frozen_now = time.time()
-        for k in cache:
-            cache[k]["ts"] = frozen_now  # свежий ts -> геттеры вернут кэш без сети
+        # v6.6: вместо заморозки кэша включаем _backtest_mode — get_signal не ходит
+        # в сеть и считает ТОЛЬКО по свечам (без look-ahead на сегодняшние макро).
+        global _backtest_mode, current_mode
+        _backtest_mode = True
+        saved_mode = current_mode
 
         trades = []
         for i in range(50, len(df) - 1):
@@ -1903,9 +2037,9 @@ def run_backtest(days=30):
                     "timestamp": time.time() - (len(df) - i) * 5 * 60, "metrics": {},
                 })
 
-        # Восстановить кэш
-        for k in cache_backup:
-            cache[k] = cache_backup[k]
+        # v6.6: восстанавливаем нормальный режим (кэш больше не трогаем)
+        _backtest_mode = False
+        current_mode = saved_mode
 
         if trades:
             wins = sum(1 for t in trades if t["label"] == 1)
@@ -1924,6 +2058,7 @@ def run_backtest(days=30):
             log.info(f"Бэктест за {days} дней: 0 сигналов")
             send_telegram(f"📊 Бэктест за {days} дней: 0 сигналов")
     finally:
+        _backtest_mode = False   # v6.6: ОБЯЗАТЕЛЬНО, иначе бот застрянет без сети
         _backtest_lock.release()
 
 
@@ -2083,6 +2218,31 @@ def _maybe_retrain():
         threading.Thread(target=_do, daemon=True).start()
 
 
+def _maybe_retrain_by_time():
+    """v6.6: переобучение по ВРЕМЕНИ, а не только по счётчику сделок.
+    Если прошло >48ч с последнего обучения И есть хотя бы 3 новых закрытых
+    сделки после него — переобучаем. Иначе модель 'протухает', когда сделок
+    мало (10 штук могут копиться 2 недели, а рынок уже ушёл)."""
+    now = time.time()
+    last_t = stats.get("ml_last_train_ts", 0) or 0
+    if last_t == 0:
+        return  # ещё ни разу не обучались — этим займётся счётчик/старт
+    if now - last_t < 48 * 3600:
+        return
+    new_after = [s for s in signals_history
+                 if s.get("label") is not None
+                 and s.get("close_ts", 0) > last_t]
+    if len(new_after) < 3:
+        return
+    log.info(f"ML время-триггер: {int((now-last_t)/3600)}ч с обучения, {len(new_after)} новых сделок")
+    def _do():
+        global ml_train_counter
+        if _train_model():
+            ml_train_counter = 0
+            storage_save_async()
+    threading.Thread(target=_do, daemon=True).start()
+
+
 # ========================================================
 # BACKTEST ANALYZER
 # ========================================================
@@ -2099,6 +2259,7 @@ def backtest_analyzer():
             and (now - s.get("timestamp", 0)) < 30 * 86400]
     if len(virtual) < 5 or len(real) < 5:
         analyzer_status = "мало данных"
+        last_analyzer_ts = now  # v6.6: чтобы не дёргался каждый скан
         return
     v_wr = sum(1 for s in virtual if s.get("label") == 1) / len(virtual) * 100
     r_wr = sum(1 for s in real if s.get("label") == 1) / len(real) * 100
@@ -2156,6 +2317,7 @@ def weight_tuner():
     recent = [s for s in signals_history if "label" in s and s.get("label") is not None
               and (now - s.get("timestamp", 0)) < 30 * 86400]
     if len(recent) < TUNER_MIN_TRADES:
+        last_tuner_ts = now  # v6.6: иначе вызывается каждый скан впустую
         return
 
     # Сначала затухание к 1.0 (если фактор перестал подтверждаться — откатывается)
@@ -2335,7 +2497,7 @@ def run_scan():
         return
 
     msg = [
-        f"<b>[{'🧪 ТЕСТ' if FORCE_TEST else '⚔️ БОЕВОЙ'}] v6.4 {'LIVE' if LIVE else 'DEMO'}</b>",
+        f"<b>[{'🧪 ТЕСТ' if FORCE_TEST else '⚔️ БОЕВОЙ'}] v6.6 {'LIVE' if LIVE else 'DEMO'}</b>",
         f"{'🟢' if direction == 'LONG' else '🔴'} <b>SCALP {direction}</b>",
         "",
         f"<b>Надёжность:</b> {score_bar(score)}",
@@ -2409,7 +2571,7 @@ def _send_heartbeat(price, atr_val, L, S, score, direction):
                    f"{stats['ml_samples_at_last_train']} примеров | {last_train}")
 
     send_telegram(
-        f"<b>❤️ Heartbeat v6.4 [{'LIVE' if LIVE else 'DEMO'}]</b>\n\n"
+        f"<b>❤️ Heartbeat v6.6 [{'LIVE' if LIVE else 'DEMO'}]</b>\n\n"
         f"💰 ETH: {price:.2f} | ATR: {atr_val:.2f}\n"
         f"😨 F&G:{fg} L/S:{ls:.2f}\n"
         f"📈 1h: {'🟢 Бычий' if b1h else '🔴 Медвежий'} ({p1h:+.2f}%)\n"
@@ -2505,7 +2667,7 @@ def backtest_endpoint():
 # ========================================================
 def bot_loop():
     global backtest_done_initial
-    log.info("🚀 OKX Scalp Bot v6.4 starting")
+    log.info("🚀 OKX Scalp Bot v6.6 starting")
 
     storage_load_all()
 
@@ -2570,7 +2732,7 @@ def bot_loop():
     tr_hours = "круглосуточно" if TRADING_HOURS is None else f"{TRADING_HOURS[0]}-{TRADING_HOURS[1]} UTC"
 
     send_telegram(
-        f"🚀 <b>OKX Bot v6.4 [{TIMEFRAME}] {'⚔️LIVE' if LIVE else '🧪DEMO'}</b>\n\n"
+        f"🚀 <b>OKX Bot v6.6 [{TIMEFRAME}] {'⚔️LIVE' if LIVE else '🧪DEMO'}</b>\n\n"
         f"💼 OKX | {SYMBOL}\n"
         f"📈 Плечо: x{LEVERAGE} | Сделка: {ORDER_USDT} USDT\n"
         f"⏱ Таймфрейм: <b>{TIMEFRAME}</b>\n"
@@ -2584,19 +2746,23 @@ def bot_loop():
         f"📊 История: {stats['total']} сд | ✅ {stats['wins']} ({winrate:.1f}%)\n"
         f"📜 Сигналов в базе: {len(signals_history)}\n\n"
         f"{ml_status_msg}\n\n"
-        f"<b>Изменения v6.4:</b>\n"
-        f"* Тройное касание: 1 сторона\n"
-        f"* TP1 от настоящего ATR\n"
-        f"* Единый режим (гистерезис {REGIME_LOW}/{REGIME_HIGH})\n"
-        f"* Tuner +0.05 + откат к 1.0\n"
-        f"* Бэктест без race на кэше\n"
-        f"* 1h-подтверждение без рекурсии\n"
-        f"* losses_in_row только на реальном убытке"
+        f"<b>Изменения v6.6:</b>\n"
+        f"* Запросы к Binance урезаны (кэши+batch)\n"
+        f"* Фильтр середины канала + круглые уровни\n"
+        f"* BB squeeze + бонус каналу в Азию\n"
+        f"* Time-stop закрывает только в плюс\n"
+        f"* TP1->БУ+комиссия, sweep алго\n"
+        f"* ML время-триггер (48ч), decay 5д\n"
+        f"* Бэктест без look-ahead на макро"
     )
 
     while True:
         try:
             run_scan()
+            try:
+                _maybe_retrain_by_time()  # v6.6: ML не протухает при редких сделках
+            except Exception as e:
+                log.error(f"ML time-retrain error: {e}")
             try:
                 if time.time() - last_tuner_ts >= TUNER_INTERVAL_DAYS * 86400:
                     threading.Thread(target=weight_tuner, daemon=True).start()
