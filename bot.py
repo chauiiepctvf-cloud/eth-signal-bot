@@ -1,17 +1,14 @@
 """
-OKX Scalp Bot v6.6 (ETH-USDT-SWAP)
+OKX Scalp Bot v6.7 (ETH-USDT-SWAP)
 Многофакторный скальпинг с ML-обучением
 Адаптивный режим тренд/канал | Weight Tuner | Backtest Analyzer
 
-Изменения v6.6 (по сравнению с v6.4/6.5):
-* Запросы к Binance урезаны: кэш btc_momentum(60с), confirm_1h_bias(5мин), batch-тикеры, dominance 30мин, fear&greed/4h 2ч
-* Канал: штраф за середину (BB% 0.4-0.6), круглые уровни, BB squeeze, бонус в Азию (0-8 UTC)
-* Тройное касание: 2-3 бонус, 4+ слабее (истощение уровня)
-* Time-stop закрывает позицию ТОЛЬКО в плюсе, в минусе ждёт SL
-* TP1 на полпути -> стоп в БУ+комиссия при исполнении (v6.5), sweep осиротевших алго
-* ML: время-триггер (>48ч и >=3 новых сделок), decay 7->5 дней
-* Бэктест: _backtest_mode вместо заморозки кэша (нет look-ahead на сегодняшние макро)
-* Tuner/Analyzer: last_ts ставится при раннем выходе (не дёргаются каждый скан)
+Изменения v6.7 (поверх v6.6):
+* Разовая чистка виртуальных (backtest) сделок — они отравляли ML и Analyzer
+* Analyzer заморожен до 100 реальных сделок; MIN_SCORE сброшен к базе
+* ML-штраф смягчён вдвое; ML не применяется при accuracy < 55%
+* TP1 сдвинут на 65% пути к TP; БУ-запас 0.3% (против проскальзывания)
+* Ретрай открытия ордера при временном сбое OKX
 """
 
 import os
@@ -156,9 +153,8 @@ RSI_OVERHEAT_SHORT  = 25
 BB_OVERHEAT_LONG    = 0.95
 BB_OVERHEAT_SHORT   = 0.5
 
-# Безубыток после TP1 (v6.5): стоп переезжает на entry +/- этот буфер,
-# чтобы покрыть тейкерскую комиссию обеих сторон (~0.05% x2 = 0.1%) и гарантировать неотрицательный итог.
-BREAKEVEN_FEE_PCT   = 0.0012   # 0.12% запас за вход (в сторону прибыли)
+# Безубыток после TP1: стоп переезжает на entry +/- этот буфер.
+BREAKEVEN_FEE_PCT   = 0.0030   # v6.7: 0.3% запас (покрывает комиссию + проскальзывание рыночного БУ-стопа на x20)
 
 # ML
 ML_RETRAIN_EVERY= 10
@@ -397,7 +393,6 @@ def storage_load_all():
     ml_train_counter = int(data.get("ml_train_counter", 0) or 0)
     last_analyzer_ts = float(data.get("last_analyzer_ts", 0) or 0)
     last_tuner_ts = float(data.get("last_tuner_ts", 0) or 0)
-    tuner_rsi_long_mult = float(data.get("tuner_rsi_long_mult", 1.0) or 1.0)
     tuner_rsi_short_mult = float(data.get("tuner_rsi_short_mult", 1.0) or 1.0)
     tuner_bb_long_mult = float(data.get("tuner_bb_long_mult", 1.0) or 1.0)
     tuner_bb_short_mult = float(data.get("tuner_bb_short_mult", 1.0) or 1.0)
@@ -605,14 +600,25 @@ def okx_place_order(direction, entry, sl, tp, atr_val=0.0):
 
     log.info(f"{direction} qty={total_qty} entry={entry:.2f} sl={sl:.2f} tp={tp:.2f} atr={atr_val:.2f}")
 
-    r = okx_post("/api/v5/trade/order", {
-        "instId":  SYMBOL,
-        "tdMode":  "cross",
-        "side":    side,
-        "posSide": pos_side,
-        "ordType": "market",
-        "sz":      str(total_qty),
-    })
+    # v6.7: ретрай открытия при временном сбое OKX ("Service temporarily unavailable")
+    r = {}
+    for attempt in range(3):
+        r = okx_post("/api/v5/trade/order", {
+            "instId":  SYMBOL,
+            "tdMode":  "cross",
+            "side":    side,
+            "posSide": pos_side,
+            "ordType": "market",
+            "sz":      str(total_qty),
+        })
+        if r.get("code") == "0":
+            break
+        emsg = r.get("msg", "") + str(r.get("data", ""))
+        if "unavailable" in emsg.lower() or "timeout" in emsg.lower() or r.get("code") == "50013":
+            log.warning(f"OKX недоступен (попытка {attempt+1}/3), жду...")
+            time.sleep(2 ** attempt)
+            continue
+        break  # другая ошибка — не ретраим
 
     if r.get("code") != "0":
         msg = r.get("msg", "Unknown")
@@ -659,9 +665,9 @@ def okx_place_order(direction, entry, sl, tp, atr_val=0.0):
             break
         time.sleep(1)
 
-    # TP1: 50% позиции на ПОЛПУТИ между входом и основным TP (v6.5)
-    # При исполнении TP1 стоп переедет в БУ+комиссия (см. _check_tp1_breakeven).
-    tp1_price = round((entry + tp) / 2, 2)
+    # TP1: 50% позиции на 65% пути к основному TP (v6.7: было 50% — слишком близко,
+    # фикс не перекрывал минус остатка при откате в БУ с проскальзыванием).
+    tp1_price = round(entry + (tp - entry) * 0.65, 2)
     tp1_qty = total_qty // 2
     tp1_algo_id = None
 
@@ -786,7 +792,6 @@ def check_closed_positions():
             pos = active_positions.get(order_id)
             if not pos:
                 continue
-
             age_hrs = (now - pos.get("open_time", now)) / 3600
             if (pos.get("pos_side") in open_sides
                 and age_hrs > MAX_HOLD_HOURS):
@@ -1527,11 +1532,6 @@ def confirm_1h_bias():
     except Exception as e:
         log.error(f"confirm_1h_bias: {e}")
         return None
-
-
-# ========================================================
-# СИГНАЛ
-# ========================================================
 def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
     global ob_history, last_ob, yesterday_high, yesterday_low
     global force_test_done, red_news_until, current_mode
@@ -1975,8 +1975,6 @@ def get_signal(df, funding, ob, spread_pct, btc_mom, btc_dir):
         return "SHORT", entry, sl, tp, S, reason_str, L, S, ml_metrics
 
     return None, None, None, None, max(L, S), reason_str, L, S, ml_metrics
-
-
 # ========================================================
 # БЭКТЕСТ (ФИКС v6.4: работает на копии кэша, не замораживает глобальный)
 # ========================================================
@@ -2193,14 +2191,18 @@ def _train_model():
 def get_ml_bonus(L, S, m):
     if scalp_model is None:
         return 0.0
+    # v6.7: если модель предсказывает не лучше монетки (CV acc < 0.55), не доверяем ей.
+    if stats.get("ml_last_accuracy", 0) < 0.55:
+        return 0.0
     try:
         X = np.array([_ml_features(L, S, m)])
         Xs = scalp_model["scaler"].transform(X)
         prob = scalp_model["model"].predict_proba(Xs)[0][1]
+        # v6.7: штрафы смягчены вдвое (-0.5 убивал входы в одиночку вместе с Analyzer).
         if   prob > 0.7: return +0.5
         elif prob > 0.6: return +0.25
-        elif prob < 0.3: return -0.5
-        elif prob < 0.4: return -0.25
+        elif prob < 0.3: return -0.25
+        elif prob < 0.4: return -0.15
         return 0.0
     except Exception:
         return 0.0
@@ -2257,9 +2259,11 @@ def backtest_analyzer():
     virtual = [s for s in signals_history if s.get("source") == "backtest" and "label" in s]
     real = [s for s in signals_history if s.get("source") != "backtest" and "label" in s
             and (now - s.get("timestamp", 0)) < 30 * 86400]
-    if len(virtual) < 5 or len(real) < 5:
-        analyzer_status = "мало данных"
-        last_analyzer_ts = now  # v6.6: чтобы не дёргался каждый скан
+    # v6.7: Analyzer заморожен пока мало РЕАЛЬНЫХ сделок. На 45 сделках его решения —
+    # статистический шум, который задрал MIN_SCORE до 6.3 и убил входы.
+    if len(real) < 100 or len(virtual) < 20:
+        analyzer_status = f"заморожен (реальных {len(real)}/100)"
+        last_analyzer_ts = now
         return
     v_wr = sum(1 for s in virtual if s.get("label") == 1) / len(virtual) * 100
     r_wr = sum(1 for s in real if s.get("label") == 1) / len(real) * 100
@@ -2363,8 +2367,6 @@ def weight_tuner():
         tuner_last_changes = "без изменений (затухание к 1.0)"
         send_telegram("🔧 Tuner: без изменений")
     storage_save_async()
-
-
 # ========================================================
 # АНТИ-ЧЕЙЗИНГ / КУЛДАУН
 # ========================================================
@@ -2497,7 +2499,7 @@ def run_scan():
         return
 
     msg = [
-        f"<b>[{'🧪 ТЕСТ' if FORCE_TEST else '⚔️ БОЕВОЙ'}] v6.6 {'LIVE' if LIVE else 'DEMO'}</b>",
+        f"<b>[{'🧪 ТЕСТ' if FORCE_TEST else '⚔️ БОЕВОЙ'}] v6.7 {'LIVE' if LIVE else 'DEMO'}</b>",
         f"{'🟢' if direction == 'LONG' else '🔴'} <b>SCALP {direction}</b>",
         "",
         f"<b>Надёжность:</b> {score_bar(score)}",
@@ -2571,7 +2573,7 @@ def _send_heartbeat(price, atr_val, L, S, score, direction):
                    f"{stats['ml_samples_at_last_train']} примеров | {last_train}")
 
     send_telegram(
-        f"<b>❤️ Heartbeat v6.6 [{'LIVE' if LIVE else 'DEMO'}]</b>\n\n"
+        f"<b>❤️ Heartbeat v6.7 [{'LIVE' if LIVE else 'DEMO'}]</b>\n\n"
         f"💰 ETH: {price:.2f} | ATR: {atr_val:.2f}\n"
         f"😨 F&G:{fg} L/S:{ls:.2f}\n"
         f"📈 1h: {'🟢 Бычий' if b1h else '🔴 Медвежий'} ({p1h:+.2f}%)\n"
@@ -2667,9 +2669,33 @@ def backtest_endpoint():
 # ========================================================
 def bot_loop():
     global backtest_done_initial
-    log.info("🚀 OKX Scalp Bot v6.6 starting")
+    log.info("🚀 OKX Scalp Bot v6.7 starting")
 
     storage_load_all()
+
+    # v6.7: РАЗОВАЯ ЧИСТКА. Старые виртуальные (backtest) сделки считались на кривых
+    # данных (текущие метрики на прошлых свечах) -> отравили ML (acc 65->51%) и Analyzer
+    # (задрал MIN_SCORE до 6.3). Удаляем их и сбрасываем порог к базе.
+    global MIN_SCORE, MIN_SCORE_LONG, MIN_SCORE_SHORT, scalp_model
+    n_before = len(signals_history)
+    bad = [s for s in signals_history if s.get("source") == "backtest"]
+    if bad:
+        signals_history[:] = [s for s in signals_history if s.get("source") != "backtest"]
+        log.info(f"v6.7 чистка: удалено {len(bad)} виртуальных сделок ({n_before}->{len(signals_history)})")
+        send_telegram(
+            f"🧹 <b>v6.7 чистка данных</b>\n"
+            f"Удалено {len(bad)} виртуальных (backtest) сделок,\n"
+            f"которые отравляли ML и Analyzer.\n"
+            f"ML будет переобучен на чистых реальных."
+        )
+        scalp_model = None  # сбрасываем модель — переобучится ниже на чистых данных
+    # Сброс порога к базе (Analyzer ранее задрал его до 6.3)
+    if MIN_SCORE != BASE_MIN_SCORE:
+        log.info(f"v6.7: MIN_SCORE сброшен {MIN_SCORE} -> {BASE_MIN_SCORE}")
+        MIN_SCORE = BASE_MIN_SCORE
+        MIN_SCORE_LONG = BASE_MIN_SCORE
+        MIN_SCORE_SHORT = BASE_MIN_SCORE - 0.5
+    storage_save_async()
 
     labeled = [s for s in signals_history if s.get("label") is not None]
     unlabeled = [s for s in signals_history if s.get("label") is None]
@@ -2732,7 +2758,7 @@ def bot_loop():
     tr_hours = "круглосуточно" if TRADING_HOURS is None else f"{TRADING_HOURS[0]}-{TRADING_HOURS[1]} UTC"
 
     send_telegram(
-        f"🚀 <b>OKX Bot v6.6 [{TIMEFRAME}] {'⚔️LIVE' if LIVE else '🧪DEMO'}</b>\n\n"
+        f"🚀 <b>OKX Bot v6.7 [{TIMEFRAME}] {'⚔️LIVE' if LIVE else '🧪DEMO'}</b>\n\n"
         f"💼 OKX | {SYMBOL}\n"
         f"📈 Плечо: x{LEVERAGE} | Сделка: {ORDER_USDT} USDT\n"
         f"⏱ Таймфрейм: <b>{TIMEFRAME}</b>\n"
@@ -2746,14 +2772,12 @@ def bot_loop():
         f"📊 История: {stats['total']} сд | ✅ {stats['wins']} ({winrate:.1f}%)\n"
         f"📜 Сигналов в базе: {len(signals_history)}\n\n"
         f"{ml_status_msg}\n\n"
-        f"<b>Изменения v6.6:</b>\n"
-        f"* Запросы к Binance урезаны (кэши+batch)\n"
-        f"* Фильтр середины канала + круглые уровни\n"
-        f"* BB squeeze + бонус каналу в Азию\n"
-        f"* Time-stop закрывает только в плюс\n"
-        f"* TP1->БУ+комиссия, sweep алго\n"
-        f"* ML время-триггер (48ч), decay 5д\n"
-        f"* Бэктест без look-ahead на макро"
+        f"<b>Изменения v6.7:</b>\n"
+        f"* Чистка виртуальных сделок (отравляли ML/Analyzer)\n"
+        f"* Analyzer заморожен до 100 сделок, MIN сброшен\n"
+        f"* ML-штраф смягчён, не активен при acc<55%\n"
+        f"* TP1 на 65% пути, БУ-запас 0.3%\n"
+        f"* Ретрай открытия при сбое OKX"
     )
 
     while True:
@@ -2793,3 +2817,4 @@ if __name__ == "__main__":
     threading.Thread(target=watchdog_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
